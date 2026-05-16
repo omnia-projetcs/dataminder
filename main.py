@@ -17,11 +17,11 @@ def process_documents(source_dir, dest_dir, model_name):
     for root, _, files in os.walk(source_dir):
         for file in files:
             ext = os.path.splitext(file)[1].lower()
-            if ext in ['.txt', '.md', '.docx', '.pdf']:
+            if ext in ['.txt', '.md', '.docx', '.pdf', '.cbz', '.cbr', '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm']:
                 files_to_process.append(os.path.join(root, file))
     
     if not files_to_process:
-        print(f"No supported documents (txt, md, pdf, docx) found in '{source_dir}'.")
+        print(f"No supported documents (txt, md, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm) found in '{source_dir}'.")
         return
         
     print(f"Found {len(files_to_process)} documents to process.")

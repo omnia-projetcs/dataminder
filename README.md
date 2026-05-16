@@ -3,7 +3,7 @@
 Dataminder is a Python tool that automatically extracts text from various types of documents (Text, Markdown, Word, standard PDFs, and scanned PDFs) and generates a detailed summary in Markdown format using a local Artificial Intelligence model (Ollama).
 
 ## Features
-- Support for multiple formats: `.txt`, `.md`, `.docx`, `.pdf`.
+- Support for multiple formats: `.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`.
 - **Automatic OCR (Optical Character Recognition)**: If a scanned PDF is detected (very little raw text), the script switches to OCR to read the content from the images.
 - Seamless integration with Ollama for summary generation.
 

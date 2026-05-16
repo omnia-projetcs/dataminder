@@ -7,7 +7,7 @@ echo "=========================================="
 echo -e "\n[1/2] Installing system packages (requires administrator rights)..."
 # Requests sudo rights if necessary
 sudo apt-get update
-sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra poppler-utils
+sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra poppler-utils antiword libchm-bin
 
 echo -e "\n[2/3] Installing Python packages (Virtual Environment)..."
 # Checks if the venv folder exists, creates it otherwise

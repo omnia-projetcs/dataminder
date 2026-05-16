@@ -5,3 +5,9 @@ python-docx
 ollama
 requests
 tqdm
+rarfile
+python-pptx
+pandas
+openpyxl
+xlrd
+beautifulsoup4
