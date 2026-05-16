@@ -161,12 +161,53 @@ def deduplicate_qa(qa_list, threshold=0.85):
             unique_qa.append(qa)
     return unique_qa
 
+def _load_already_processed(raw_path):
+    """Read the raw JSONL file and return a set of source filenames already processed."""
+    done = set()
+    if not os.path.exists(raw_path):
+        return done
+    with open(raw_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                src = obj.get("_source_file", "")
+                if src:
+                    done.add(src)
+            except json.JSONDecodeError:
+                continue
+    return done
+
+
+def _load_raw_pairs(raw_path):
+    """Read all Q&A pairs from the raw JSONL file."""
+    pairs = []
+    if not os.path.exists(raw_path):
+        return pairs
+    with open(raw_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if "question" in obj and "answer" in obj:
+                    pairs.append({"question": obj["question"], "answer": obj["answer"]})
+            except json.JSONDecodeError:
+                continue
+    return pairs
+
+
 def generate_qa_dataset(source_dir, dest_dir, model_name):
     if not os.path.exists(source_dir):
         print(f"Source directory '{source_dir}' does not exist. Creating it now...")
         os.makedirs(source_dir, exist_ok=True)
 
     os.makedirs(dest_dir, exist_ok=True)
+    
+    raw_jsonl_path = os.path.join(dest_dir, "dataset_qa_raw.jsonl")
     
     files_to_process = []
     for root, _, files in os.walk(source_dir):
@@ -177,66 +218,86 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
     if not files_to_process:
         print(f"No Markdown (.md) files found in '{source_dir}'.")
         return
-        
-    print(f"Found {len(files_to_process)} Markdown files to process for Q&A generation.")
     
-    all_qa_pairs = []
-    failed_files = 0
-    pbar = tqdm(files_to_process, desc="Generating Q&A", unit="file")
-         
-    for input_path in pbar:
-        filename = os.path.basename(input_path)
-        pbar.set_postfix({"file": filename[:20], "q_found": len(all_qa_pairs)})
+    # Check which files were already processed (resume support)
+    already_done = _load_already_processed(raw_jsonl_path)
+    if already_done:
+        total_before = len(files_to_process)
+        files_to_process = [f for f in files_to_process if os.path.basename(f) not in already_done]
+        print(f"Resuming: {total_before - len(files_to_process)} files already processed, {len(files_to_process)} remaining.")
+    
+    total_saved = len(_load_raw_pairs(raw_jsonl_path))
         
-        try:
-            with open(input_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-                
-            if not text.strip():
-                log_error(input_path, "File is empty.")
-                continue
-                
-            # Limit text size if it's too huge to prevent context blowup
-            text = text[:20000] 
-                
-            qa_pairs = generate_qa_from_text(text, model_name=model_name)
+    if files_to_process:
+        print(f"Processing {len(files_to_process)} Markdown files for Q&A generation...")
+        
+        failed_files = 0
+        pbar = tqdm(files_to_process, desc="Generating Q&A", unit="file")
+             
+        for input_path in pbar:
+            filename = os.path.basename(input_path)
+            pbar.set_postfix({"file": filename[:20], "q_saved": total_saved})
             
-            if isinstance(qa_pairs, list):
-                file_count = 0
-                for qa in qa_pairs:
-                    if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
-                        all_qa_pairs.append({
-                            "question": qa['question'],
-                            "answer": qa['answer']
-                        })
-                        file_count += 1
-                if file_count == 0:
+            try:
+                with open(input_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                    
+                if not text.strip():
+                    log_error(input_path, "File is empty.")
+                    continue
+                    
+                # Limit text size if it's too huge to prevent context blowup
+                text = text[:20000] 
+                    
+                qa_pairs = generate_qa_from_text(text, model_name=model_name)
+                
+                if isinstance(qa_pairs, list):
+                    file_count = 0
+                    # Write each valid pair immediately to the raw JSONL file
+                    with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
+                        for qa in qa_pairs:
+                            if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
+                                record = {
+                                    "question": qa['question'],
+                                    "answer": qa['answer'],
+                                    "_source_file": filename
+                                }
+                                f_raw.write(json.dumps(record, ensure_ascii=False) + "\n")
+                                file_count += 1
+                                total_saved += 1
+                    if file_count == 0:
+                        failed_files += 1
+                        tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
+                    else:
+                        tqdm.write(f"  [{filename}] +{file_count} pairs saved (total: {total_saved})")
+                else:
                     failed_files += 1
-                    tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
-            else:
+                    log_error(input_path, "AI did not return a valid list of QA pairs.")
+            except Exception as e:
                 failed_files += 1
-                log_error(input_path, "AI did not return a valid list of QA pairs.")
-        except Exception as e:
-            failed_files += 1
-            log_error(input_path, f"Unexpected exception: {str(e)}")
-            tqdm.write(f"  [{filename}] Error: {str(e)}")
-            continue
+                log_error(input_path, f"Unexpected exception: {str(e)}")
+                tqdm.write(f"  [{filename}] Error: {str(e)}")
+                continue
 
-    # Deduplication phase
-    print(f"\nPhase 1 Complete. Generated {len(all_qa_pairs)} initial Q&A pairs ({failed_files} files had issues).")
+        print(f"\nPhase 1 Complete. {total_saved} total raw Q&A pairs on disk ({failed_files} files had issues).")
+    else:
+        print("All files already processed. Skipping to deduplication.")
+    
+    # Load all raw pairs from disk for deduplication
+    all_qa_pairs = _load_raw_pairs(raw_jsonl_path)
     
     if not all_qa_pairs:
         print("ERROR: No Q&A pairs were generated at all! Check error.log for details.")
         print("Common causes: Ollama not running, model not available, or all AI responses were unparseable.")
         return
     
-    print("Phase 2: Removing duplicates (similarity threshold 85%)...")
+    print(f"Phase 2: Removing duplicates from {len(all_qa_pairs)} pairs (similarity threshold 85%)...")
     unique_qa_pairs = deduplicate_qa(all_qa_pairs, threshold=0.85)
     
     dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
     dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
     
-    print("Phase 3: Saving files...")
+    print("Phase 3: Saving final clean files...")
     
     # Save JSON array
     with open(dataset_json_path, 'w', encoding='utf-8') as f_json:
@@ -255,3 +316,4 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
     print(f"\nQ&A Generation Complete! Generated {len(unique_qa_pairs)} unique Q&A pairs (Removed {len(all_qa_pairs) - len(unique_qa_pairs)} duplicates).")
     print(f"Saved JSON dataset to: {dataset_json_path}")
     print(f"Saved Markdown readable dataset to: {dataset_md_path}")
+    print(f"Raw data preserved in: {raw_jsonl_path}")
