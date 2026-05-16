@@ -1,0 +1,31 @@
+#!/bin/bash
+
+echo "=========================================="
+echo "Dataminder Dependencies Installation"
+echo "=========================================="
+
+echo -e "\n[1/2] Installing system packages (requires administrator rights)..."
+# Requests sudo rights if necessary
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra poppler-utils
+
+echo -e "\n[2/2] Installing Python packages (Virtual Environment)..."
+# Checks if the venv folder exists, creates it otherwise
+if [ ! -d "venv" ]; then
+    echo "Creating 'venv' virtual environment..."
+    python3 -m venv venv
+fi
+
+echo "Activating the virtual environment..."
+source venv/bin/activate
+
+# Installs the Python dependencies listed in requirements.txt
+pip install -r requirements.txt
+
+echo -e "\n=========================================="
+echo "Installation completed successfully!"
+echo "Before running the application, don't forget to activate the virtual environment if not already done:"
+echo "source venv/bin/activate"
+echo "Then run:"
+echo "python main.py"
+echo "=========================================="
