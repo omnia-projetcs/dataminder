@@ -13,6 +13,8 @@ import tempfile
 import shutil
 from bs4 import BeautifulSoup
 import datetime
+import ebooklib
+from ebooklib import epub
 
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
@@ -151,6 +153,20 @@ def extract_text_from_chm(path):
         log_error(path, f"Error reading CHM: {e}. Make sure 'libchm-bin' is installed.")
         return ""
 
+def extract_text_from_epub(path):
+    try:
+        book = epub.read_epub(path, options={'ignore_ncx': True})
+        text = ""
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            extracted = soup.get_text(separator='\n', strip=True)
+            if extracted:
+                text += extracted + "\n\n"
+        return text
+    except Exception as e:
+        log_error(path, f"Error reading EPUB: {e}")
+        return ""
+
 def extract_text(path):
     ext = os.path.splitext(path)[1].lower()
     
@@ -172,6 +188,8 @@ def extract_text(path):
         return extract_text_from_html(path)
     elif ext == '.chm':
         return extract_text_from_chm(path)
+    elif ext == '.epub':
+        return extract_text_from_epub(path)
     else:
         log_error(path, f"Unsupported file extension: {ext}")
         return ""

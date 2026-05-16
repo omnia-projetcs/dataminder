@@ -15,7 +15,7 @@
 - **Fail-Safe Pipeline:** Continuous processing with automatic skipped files and comprehensive `error.log` generation.
 
 ## Supported Formats
-`.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`
+`.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.epub`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`
 
 ## Prerequisites
 
