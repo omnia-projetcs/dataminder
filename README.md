@@ -45,7 +45,7 @@ chmod +x install.sh
    python main.py --source ./my_documents --dest ./my_summaries --model llama3
    ```
    
-   The output files will be named with the current date and time to ensure uniqueness (e.g., `2026-05-16_12-30-00.md`).
+   The output files will be named with the current date and time to ensure uniqueness (e.g., `2026-05-16_12-30-00_document.md`).
 
 ## Configuration
 

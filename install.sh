@@ -19,6 +19,10 @@ fi
 echo "Activating the virtual environment..."
 source venv/bin/activate
 
+# Upgrades pip to avoid warnings
+echo "Upgrading pip..."
+pip install --upgrade pip
+
 # Installs the Python dependencies listed in requirements.txt
 pip install -r requirements.txt
 
