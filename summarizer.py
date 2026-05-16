@@ -6,15 +6,22 @@ def summarize_text(text, model_name="ministral-3:8b"):
 
     # Prompt definition
     prompt = f"""
-Here is the content of a document. Provide a detailed summary of this text, highlighting the most important points. 
-Structure your response in Markdown format (with headings, bullet points for key points, etc.).
+Here is the content of a document. 
+
+Your tasks are:
+1. Detect the original language of the document and state it at the beginning.
+2. Provide a detailed summary of this text in ENGLISH.
+3. Translate all prose and descriptive text to ENGLISH.
+4. CRITICAL: You must preserve any code blocks, scripts, or terminal commands EXACTLY as they appear in the original text. Do not translate code syntax, variable names, or commands.
+
+Structure your response in Markdown format.
 
 Document text:
 ---
 {text}
 ---
 
-Detailed summary and key points:
+Analysis and Summary (in English):
 """
 
     try:

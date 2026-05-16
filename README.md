@@ -45,7 +45,7 @@ chmod +x install.sh
    python main.py --source ./my_documents --dest ./my_summaries --model llama3
    ```
    
-   The output files will be named with the current date and time to ensure uniqueness (e.g., `2026-05-16_12-30-00_document.md`).
+   The output files will keep their original name but with a `.md` extension (e.g., `document.md`). If a summary already exists for a file, it will automatically be skipped, which makes resuming interrupted jobs easy!
 
 ## Configuration
 

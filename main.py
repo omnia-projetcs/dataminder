@@ -31,9 +31,8 @@ def process_documents(source_dir, dest_dir, model_name):
         filename = os.path.basename(input_path)
         base_name, _ = os.path.splitext(filename)
         
-        # Generate date-time string
-        now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_filename = f"{now_str}_{base_name}.md"
+        # Output filename
+        output_filename = f"{base_name}.md"
         output_path = os.path.join(dest_dir, output_filename)
             
         pbar.set_postfix({"file": filename[:20], "step": "Extracting text"})
