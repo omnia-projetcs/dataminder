@@ -1,11 +1,21 @@
-# Dataminder: Document Extraction and Summarization with Ollama
+# Dataminder: Offline Document Ingestion, OCR & RAG Dataset Generator via Local LLMs
 
-Dataminder is a Python tool that automatically extracts text from various types of documents (Text, Markdown, Word, standard PDFs, and scanned PDFs) and generates a detailed summary in Markdown format using a local Artificial Intelligence model (Ollama).
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
+![Ollama](https://img.shields.io/badge/AI-Ollama-black?logo=ollama&logoColor=white)
+![Tesseract OCR](https://img.shields.io/badge/OCR-Tesseract-green)
+![Pandas](https://img.shields.io/badge/Data-Pandas-150458?logo=pandas&logoColor=white)
+![BeautifulSoup](https://img.shields.io/badge/Web-BeautifulSoup-red)
 
-## Features
-- Support for multiple formats: `.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`.
-- **Automatic OCR (Optical Character Recognition)**: If a scanned PDF is detected (very little raw text), the script switches to OCR to read the content from the images.
-- Seamless integration with Ollama for summary generation.
+**Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, HTML) including scanned images via Tesseract OCR. Using local Large Language Models (LLMs) via **Ollama**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
+
+## Why Dataminder? (Highlights)
+- **100% Offline & Private:** No API keys, no cloud data leaks. Everything runs locally on your machine.
+- **Automated ML Dataset Creation:** Seamlessly converts unstructured local documents into deduplicated Alpaca JSON datasets for AI training.
+- **Smart OCR Fallback:** Automatically detects scanned PDFs/images and switches to Tesseract OCR.
+- **Fail-Safe Pipeline:** Continuous processing with automatic skipped files and comprehensive `error.log` generation.
+
+## Supported Formats
+`.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`
 
 ## Prerequisites
 
