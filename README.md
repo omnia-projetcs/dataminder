@@ -26,6 +26,12 @@
 
 ## Installation
 
+First, clone the repository to your local machine:
+```bash
+git clone https://github.com/omnia-projetcs/dataminder.git
+cd dataminder
+```
+
 An automated script is provided to install both the system dependencies (necessary to read scanned PDFs) and the Python dependencies in a virtual environment.
 
 Run in your terminal:
@@ -79,7 +85,7 @@ Here are the most common commands you will need:
    
    You can customize this behavior using command line arguments:
    ```bash
-   python main.py --source ./my_documents --dest ./my_summaries --model llama3 --level 10
+   python main.py --source ./my_documents --dest ./my_summaries --model llama3 --level 7
    ```
    
    The output files will keep their original name but with a `.md` extension (e.g., `document.md`). If a summary already exists for a file, it will automatically be skipped, which makes resuming interrupted jobs easy!
