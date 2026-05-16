@@ -109,6 +109,8 @@ CRITICAL RULES:
 2. The answers must be self-contained and comprehensive.
 3. Keep answers in plain text. Do NOT include code blocks, markdown formatting, or newlines inside answers.
 4. Provide the output STRICTLY as a JSON array of objects. Do not write any other text or markdown block formatting.
+5. NEVER reference the source document, book, author, chapter, or publication in the questions or answers. Do NOT write things like "according to the book...", "the document states...", "the author explains...", "in chapter 3...". Write questions and answers as standalone knowledge.
+6. Questions should be about the SUBJECT MATTER itself, not about what a book says about it. For example, write "What is buffer overflow?" instead of "What does the book say about buffer overflows?".
 Format:
 [
   {{"question": "What is X?", "answer": "X is Y because Z."}},

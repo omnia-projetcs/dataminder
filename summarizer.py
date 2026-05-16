@@ -27,6 +27,7 @@ Your tasks are:
 2. Provide a summary of this text in ENGLISH. {length_instruction}
 3. Translate all prose and descriptive text to ENGLISH.
 4. CRITICAL: You must preserve any code blocks, scripts, or terminal commands EXACTLY as they appear in the original text. Do not translate code syntax, variable names, or commands.
+5. CRITICAL: NEVER reference the source document, book, author, chapter, or publication in your summary. Do NOT write things like "this book explains...", "the author describes...", "in chapter 3...", "according to the document...". Write the knowledge directly as standalone facts, as if you are teaching the subject yourself.
 
 Structure your response in Markdown format.
 
