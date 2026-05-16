@@ -100,7 +100,7 @@ def _try_parse_json(content):
     return pairs if pairs else None
 
 
-def generate_qa_from_text(text, model_name="ministral-3:8b"):
+def generate_qa_from_text(text, model_name="qwen3.5:9b"):
     prompt = f"""
 You are an expert AI dataset creator. Based on the following document, generate a list of high-quality Question/Answer pairs to be used for fine-tuning an AI model.
 
@@ -147,6 +147,29 @@ Document text:
         tqdm.write(f"  [ERROR] Ollama call failed: {e}")
         log_error("N/A", f"Ollama exception: {e}")
         return []
+
+# Regex patterns that detect references to source books/documents/authors
+_SOURCE_REF_PATTERNS = re.compile(
+    r'(?:'
+    r'(?:the|this|that|a)\s+(?:book|document|text|article|paper|publication|manual|guide|handbook|report|chapter|module|section|course|training|material|slide|presentation|lecture|reference)'
+    r'|(?:according\s+to|as\s+(?:described|explained|stated|mentioned|discussed|noted|outlined|covered|presented|defined|highlighted)\s+(?:in|by))'
+    r'|(?:the\s+author(?:s)?\s+(?:describe|explain|state|mention|discuss|note|outline|present|define|highlight|argue|suggest|recommend|emphasize|propose))'
+    r'|\bthe\s+book\s+\*'
+    r'|\*[A-Z][^*]{3,60}\*'  # catches *Book Title* in italics
+    r'|(?:in\s+chapter\s+\d)'
+    r'|(?:in\s+module\s+\d)'
+    r'|(?:in\s+section\s+\d)'
+    r'|(?:target\s+audience(?:s)?\s+(?:for|of)\s+the)'
+    r'|(?:what\s+(?:does|do|did)\s+the\s+(?:book|document|text|author|manual|guide|chapter|module))'
+    r'|(?:how\s+does\s+the\s+(?:book|document|text|author|manual|guide|chapter|module))'
+    r')',
+    re.IGNORECASE
+)
+
+def _references_source_material(qa):
+    """Return True if the Q&A pair references a source book/document/author."""
+    text = qa.get('question', '') + ' ' + qa.get('answer', '')
+    return bool(_SOURCE_REF_PATTERNS.search(text))
 
 def deduplicate_qa(qa_list, threshold=0.85):
     unique_qa = []
@@ -255,10 +278,15 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
                 
                 if isinstance(qa_pairs, list):
                     file_count = 0
+                    filtered_count = 0
                     # Write each valid pair immediately to the raw JSONL file
                     with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
                         for qa in qa_pairs:
                             if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
+                                # Filter out pairs that reference source material
+                                if _references_source_material(qa):
+                                    filtered_count += 1
+                                    continue
                                 record = {
                                     "question": qa['question'],
                                     "answer": qa['answer'],
@@ -271,7 +299,11 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
                         failed_files += 1
                         tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
                     else:
-                        tqdm.write(f"  [{filename}] +{file_count} pairs saved (total: {total_saved})")
+                        msg = f"  [{filename}] +{file_count} pairs saved"
+                        if filtered_count:
+                            msg += f" ({filtered_count} filtered: source refs)"
+                        msg += f" (total: {total_saved})"
+                        tqdm.write(msg)
                 else:
                     failed_files += 1
                     log_error(input_path, "AI did not return a valid list of QA pairs.")
@@ -293,13 +325,21 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
         print("Common causes: Ollama not running, model not available, or all AI responses were unparseable.")
         return
     
-    print(f"Phase 2: Removing duplicates from {len(all_qa_pairs)} pairs (similarity threshold 85%)...")
-    unique_qa_pairs = deduplicate_qa(all_qa_pairs, threshold=0.85)
+    # Phase 2: Filter out any remaining source references from raw data
+    print(f"Phase 2: Filtering source references from {len(all_qa_pairs)} pairs...")
+    clean_pairs = [qa for qa in all_qa_pairs if not _references_source_material(qa)]
+    filtered_refs = len(all_qa_pairs) - len(clean_pairs)
+    if filtered_refs:
+        print(f"  Removed {filtered_refs} pairs referencing source material.")
+    
+    # Phase 3: Deduplication
+    print(f"Phase 3: Removing duplicates from {len(clean_pairs)} pairs (similarity threshold 85%)...")
+    unique_qa_pairs = deduplicate_qa(clean_pairs, threshold=0.85)
     
     dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
     dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
     
-    print("Phase 3: Saving final clean files...")
+    print("Phase 4: Saving final clean files...")
     
     # Save JSON array
     with open(dataset_json_path, 'w', encoding='utf-8') as f_json:

@@ -39,9 +39,9 @@ pip install --upgrade pip
 # Installs the Python dependencies listed in requirements.txt
 pip install -r requirements.txt
 
-echo -e "\n[3/3] Downloading the Ollama model (ministral-3:8b)..."
+echo -e "\n[3/3] Downloading the Ollama model (qwen3.5:9b)..."
 echo "Please make sure Ollama is running in the background or another terminal."
-ollama pull ministral-3:8b || echo "Failed to pull the model. You can run 'ollama pull ministral-3:8b' manually later."
+ollama pull qwen3.5:9b || echo "Failed to pull the model. You can run 'ollama pull qwen3.5:9b' manually later."
 
 echo -e "\n=========================================="
 echo "Installation completed successfully!"

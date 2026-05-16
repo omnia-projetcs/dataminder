@@ -1,6 +1,6 @@
 import ollama
 
-def summarize_text(text, model_name="ministral-3:8b", level=7):
+def summarize_text(text, model_name="qwen3.5:9b", level=7):
     if not text or not text.strip():
         return "No text provided for summarization."
 
