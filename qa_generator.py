@@ -102,15 +102,15 @@ def _try_parse_json(content):
 
 def generate_qa_from_text(text, model_name="qwen3.5:9b"):
     prompt = f"""
-You are an expert AI dataset creator. Based on the following document, generate a list of high-quality Question/Answer pairs to be used for fine-tuning an AI model.
+You are an expert AI dataset creator specializing in technical cybersecurity and IT training data. Based on the following document, generate a list of high-quality Question/Answer pairs for fine-tuning an AI model. Prioritize technical, hands-on questions but also include conceptual questions when the content warrants it.
 
 CRITICAL RULES:
-1. Generate specific, detailed questions that require understanding the document. Avoid generic questions.
-2. The answers must be self-contained and comprehensive.
-3. Keep answers in plain text. Do NOT include code blocks, markdown formatting, or newlines inside answers.
-4. Provide the output STRICTLY as a JSON array of objects. Do not write any other text or markdown block formatting.
-5. NEVER reference the source document, book, author, chapter, or publication in the questions or answers. Do NOT write things like "according to the book...", "the document states...", "the author explains...", "in chapter 3...". Write questions and answers as standalone knowledge.
-6. Questions should be about the SUBJECT MATTER itself, not about what a book says about it. For example, write "What is buffer overflow?" instead of "What does the book say about buffer overflows?".
+1. PRIORITIZE highly technical and specific questions that test real-world, hands-on knowledge. Include concrete details such as tool names, command syntax, protocol specifics, CVE references, configuration parameters, registry keys, API calls, or attack technique names when available.
+2. Conceptual questions are acceptable but should remain specific and non-trivial. Avoid overly generic questions like "What is cybersecurity?" or "Why is security important?".
+3. Answers must be self-contained, precise, and technically accurate. Include specific values, commands, paths, or configurations when relevant.
+4. Keep answers in plain text. Do NOT include code blocks, markdown formatting, or newlines inside answers.
+5. NEVER reference the source document, book, author, chapter, or publication. Write questions and answers as standalone technical knowledge.
+6. Provide the output STRICTLY as a JSON array of objects. No other text.
 Format:
 [
   {{"question": "What is X?", "answer": "X is Y because Z."}},
