@@ -5,10 +5,15 @@ from extractor import extract_text
 from summarizer import summarize_text
 from tqdm import tqdm
 
+def log_error(filepath, error_msg):
+    with open("error.log", "a", encoding="utf-8") as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"[{timestamp}] FILE: {filepath} | PIPELINE ERROR: {error_msg}\n")
+
 def process_documents(source_dir, dest_dir, model_name):
     if not os.path.exists(source_dir):
-        print(f"Error: Source directory '{source_dir}' does not exist.")
-        return
+        print(f"Source directory '{source_dir}' does not exist. Creating it now...")
+        os.makedirs(source_dir, exist_ok=True)
 
     os.makedirs(dest_dir, exist_ok=True)
     print(f"Scanning '{source_dir}' recursively...")
@@ -34,28 +39,62 @@ def process_documents(source_dir, dest_dir, model_name):
         # Output filename
         output_filename = f"{base_name}.md"
         output_path = os.path.join(dest_dir, output_filename)
-            
-        pbar.set_postfix({"file": filename[:20], "step": "Extracting text"})
-        text = extract_text(input_path)
         
-        if not text.strip():
-            tqdm.write(f"[{filename}] No text could be extracted. Skipping.")
+        try:
+            # Skip if already processed
+            if os.path.exists(output_path):
+                continue
+                
+            pbar.set_postfix({"file": filename[:20], "step": "Extracting text"})
+            text = extract_text(input_path)
+            
+            if not text.strip():
+                tqdm.write(f"\n[{filename}] No text could be extracted. Skipping.")
+                log_error(input_path, "No text extracted (unsupported or OCR failed).")
+                continue
+                
+            pbar.set_postfix({"file": filename[:20], "step": "AI Summarizing"})
+            summary_md = summarize_text(text, model_name=model_name)
+            
+            pbar.set_postfix({"file": filename[:20], "step": "Saving"})
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(summary_md)
+                
+        except Exception as e:
+            error_details = str(e)
+            tqdm.write(f"\n[{filename}] Failed with error: {error_details}")
+            log_error(input_path, f"Unexpected exception: {error_details}")
             continue
-            
-        pbar.set_postfix({"file": filename[:20], "step": "AI Summarizing"})
-        summary_md = summarize_text(text, model_name=model_name)
-        
-        pbar.set_postfix({"file": filename[:20], "step": "Saving"})
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(summary_md)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
     parser.add_argument("--source", default="source", help="Source directory containing the documents to process (default: source).")
     parser.add_argument("--dest", default="destination", help="Destination directory for the Markdown summaries (default: destination).")
     parser.add_argument("--model", default="ministral-3:8b", help="Ollama model to use (default: ministral-3:8b).")
+    parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
+    parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
     
     args = parser.parse_args()
     
-    print("--- Starting document processing ---")
-    process_documents(args.source, args.dest, args.model)
+    if args.full:
+        from qa_generator import generate_qa_dataset
+        print("--- Starting FULL Pipeline ---")
+        print("\n[Step 1/2] Document Processing")
+        process_documents(args.source, args.dest, args.model)
+        
+        print("\n[Step 2/2] Q&A Dataset Generation")
+        qa_dest = "dataresults" if args.dest == "destination" else f"{args.dest}_qa"
+        generate_qa_dataset(args.dest, qa_dest, args.model)
+        print("\n--- Full Pipeline Complete ---")
+    elif args.qa:
+        from qa_generator import generate_qa_dataset
+        print("--- Starting Q&A Dataset Generation ---")
+        
+        # Override defaults specifically for QA mode if they haven't been manually changed
+        qa_source = "destination" if args.source == "source" else args.source
+        qa_dest = "dataresults" if args.dest == "destination" else args.dest
+        
+        generate_qa_dataset(qa_source, qa_dest, args.model)
+    else:
+        print("--- Starting document processing ---")
+        process_documents(args.source, args.dest, args.model)

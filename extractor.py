@@ -12,6 +12,12 @@ import pandas as pd
 import tempfile
 import shutil
 from bs4 import BeautifulSoup
+import datetime
+
+def log_error(filepath, error_msg):
+    with open("error.log", "a", encoding="utf-8") as f:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"[{timestamp}] FILE: {filepath} | EXTRACTION ERROR: {error_msg}\n")
 
 def extract_text_from_txt(path):
     with open(path, 'r', encoding='utf-8') as f:
@@ -49,7 +55,7 @@ def extract_text_from_pdf_ocr(path):
             text += pytesseract.image_to_string(img, lang='fra+eng') + "\n"
         return text
     except Exception as e:
-        print(f"[{path}] Failed to extract text via OCR. Ensure tesseract-ocr and poppler-utils are installed. Error: {e}")
+        log_error(path, f"Failed to extract text via OCR. Ensure tesseract-ocr and poppler-utils are installed. Error: {e}")
         return ""
 
 def extract_text_from_cbz_cbr(path):
@@ -74,7 +80,7 @@ def extract_text_from_cbz_cbr(path):
                         text += pytesseract.image_to_string(img, lang='fra+eng') + "\n"
         return text
     except Exception as e:
-        print(f"[{path}] Error reading archive: {e}. For CBR, make sure 'unrar' is installed on your system.")
+        log_error(path, f"Error reading archive (CBZ/CBR): {e}. Make sure 'unrar' is installed.")
         return ""
 
 def extract_text_from_pptx(path):
@@ -87,7 +93,7 @@ def extract_text_from_pptx(path):
                     text += shape.text + "\n"
         return text
     except Exception as e:
-        print(f"[{path}] Error reading PPTX: {e}")
+        log_error(path, f"Error reading PPTX: {e}")
         return ""
 
 def extract_text_from_doc(path):
@@ -96,7 +102,7 @@ def extract_text_from_doc(path):
         result = subprocess.run(['antiword', path], capture_output=True, text=True, check=True)
         return result.stdout
     except Exception as e:
-        print(f"[{path}] Error reading DOC: {e}. Make sure 'antiword' is installed on your system.")
+        log_error(path, f"Error reading DOC: {e}. Make sure 'antiword' is installed.")
         return ""
 
 def extract_text_from_excel(path):
@@ -110,7 +116,7 @@ def extract_text_from_excel(path):
             text += df.to_string(index=False) + "\n\n"
         return text
     except Exception as e:
-        print(f"[{path}] Error reading Excel file: {e}")
+        log_error(path, f"Error reading Excel file: {e}")
         return ""
 
 def extract_text_from_html(path):
@@ -119,7 +125,7 @@ def extract_text_from_html(path):
             soup = BeautifulSoup(f, 'html.parser')
             return soup.get_text(separator='\n', strip=True)
     except Exception as e:
-        print(f"[{path}] Error reading HTML: {e}")
+        log_error(path, f"Error reading HTML: {e}")
         return ""
 
 def extract_text_from_chm(path):
@@ -142,7 +148,7 @@ def extract_text_from_chm(path):
                                 text += f"--- Section: {file} ---\n" + extracted + "\n\n"
         return text
     except Exception as e:
-        print(f"[{path}] Error reading CHM: {e}. Make sure 'libchm-bin' is installed on your system.")
+        log_error(path, f"Error reading CHM: {e}. Make sure 'libchm-bin' is installed.")
         return ""
 
 def extract_text(path):
@@ -167,5 +173,5 @@ def extract_text(path):
     elif ext == '.chm':
         return extract_text_from_chm(path)
     else:
-        print(f"[{path}] Unsupported file extension: {ext}")
+        log_error(path, f"Unsupported file extension: {ext}")
         return ""
