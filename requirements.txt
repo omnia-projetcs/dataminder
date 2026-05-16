@@ -4,3 +4,4 @@ pytesseract
 python-docx
 ollama
 requests
+tqdm

@@ -1,52 +1,62 @@
 import os
+import argparse
+from datetime import datetime
 from extractor import extract_text
 from summarizer import summarize_text
+from tqdm import tqdm
 
-# Configuration
-INPUT_DIR = "input_docs"
-OUTPUT_DIR = "output_summaries"
-OLLAMA_MODEL = "llama3" # You can change this to mistral, mixtral, phi3, etc.
+def process_documents(source_dir, dest_dir, model_name):
+    if not os.path.exists(source_dir):
+        print(f"Error: Source directory '{source_dir}' does not exist.")
+        return
 
-def setup_directories():
-    os.makedirs(INPUT_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"Directories configured: '{INPUT_DIR}/' (for your documents) and '{OUTPUT_DIR}/' (for the summaries).")
-
-def process_documents():
-    setup_directories()
+    os.makedirs(dest_dir, exist_ok=True)
+    print(f"Scanning '{source_dir}' recursively...")
     
-    files = [f for f in os.listdir(INPUT_DIR) if os.path.isfile(os.path.join(INPUT_DIR, f))]
+    files_to_process = []
+    for root, _, files in os.walk(source_dir):
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in ['.txt', '.md', '.docx', '.pdf']:
+                files_to_process.append(os.path.join(root, file))
     
-    if not files:
-        print(f"No documents found in the '{INPUT_DIR}/' directory. Please place your files (txt, md, pdf, docx) there.")
+    if not files_to_process:
+        print(f"No supported documents (txt, md, pdf, docx) found in '{source_dir}'.")
         return
         
-    for filename in files:
-        input_path = os.path.join(INPUT_DIR, filename)
+    print(f"Found {len(files_to_process)} documents to process.")
+    
+    pbar = tqdm(files_to_process, desc="Processing", unit="doc")
+    for input_path in pbar:
+        filename = os.path.basename(input_path)
         base_name, _ = os.path.splitext(filename)
-        output_path = os.path.join(OUTPUT_DIR, f"{base_name}.md")
         
-        # Skip if already processed
-        if os.path.exists(output_path):
-            print(f"[{filename}] Summary already exists. Skipping to the next file...")
-            continue
+        # Generate date-time string
+        now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_filename = f"{now_str}_{base_name}.md"
+        output_path = os.path.join(dest_dir, output_filename)
             
-        print(f"[{filename}] 1/3 Extracting text...")
+        pbar.set_postfix({"file": filename[:20], "step": "Extracting text"})
         text = extract_text(input_path)
         
         if not text.strip():
-            print(f"[{filename}] No text could be extracted.")
+            tqdm.write(f"[{filename}] No text could be extracted. Skipping.")
             continue
             
-        print(f"[{filename}] 2/3 Generating summary via Ollama (model {OLLAMA_MODEL}). This may take a few moments...")
-        summary_md = summarize_text(text, model_name=OLLAMA_MODEL)
+        pbar.set_postfix({"file": filename[:20], "step": "AI Summarizing"})
+        summary_md = summarize_text(text, model_name=model_name)
         
-        print(f"[{filename}] 3/3 Saving summary...")
+        pbar.set_postfix({"file": filename[:20], "step": "Saving"})
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(summary_md)
-            
-        print(f"[{filename}] Successfully completed! (Saved in {output_path})\n")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract and summarize documents.")
+    parser.add_argument("--source", default="source", help="Source directory containing the documents to process (default: source).")
+    parser.add_argument("--dest", default="destination", help="Destination directory for the Markdown summaries (default: destination).")
+    parser.add_argument("--model", default="ministral-3:8b", help="Ollama model to use (default: ministral-3:8b).")
+    
+    args = parser.parse_args()
+    
     print("--- Starting document processing ---")
-    process_documents()
+    process_documents(args.source, args.dest, args.model)
