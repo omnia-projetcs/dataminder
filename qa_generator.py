@@ -11,6 +11,95 @@ def log_error(filepath, error_msg):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] FILE: {filepath} | QA GENERATION ERROR: {error_msg}\n")
 
+def _sanitize_json_string(raw_json):
+    """Sanitize a JSON string that may contain literal control characters
+    (newlines, tabs, etc.) inside string values, which is invalid JSON.
+    This replaces unescaped control characters with their escape sequences."""
+    # Replace literal control characters that break JSON parsing
+    # We need to be careful: \n that is already escaped (\\n in the raw string) should stay.
+    # Strategy: process character by character tracking if we're inside a JSON string value.
+    
+    result = []
+    in_string = False
+    i = 0
+    while i < len(raw_json):
+        ch = raw_json[i]
+        
+        if ch == '\\' and in_string and i + 1 < len(raw_json):
+            # Escaped character inside a string — keep both characters as-is
+            result.append(ch)
+            result.append(raw_json[i + 1])
+            i += 2
+            continue
+        
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            i += 1
+            continue
+        
+        if in_string:
+            # Replace literal control characters with their JSON escape sequences
+            if ch == '\n':
+                result.append('\\n')
+            elif ch == '\r':
+                result.append('\\r')
+            elif ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+        else:
+            result.append(ch)
+        
+        i += 1
+    
+    return ''.join(result)
+
+
+def _try_parse_json(content):
+    """Try multiple strategies to extract a JSON array from LLM output."""
+    
+    # Strategy 1: Extract JSON from markdown code block ```json ... ```
+    code_block_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
+    if code_block_match:
+        json_str = code_block_match.group(1)
+        sanitized = _sanitize_json_string(json_str)
+        try:
+            return json.loads(sanitized)
+        except json.JSONDecodeError:
+            pass
+    
+    # Strategy 2: Find the outermost [...] array
+    match = re.search(r'\[.*\]', content, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+        sanitized = _sanitize_json_string(json_str)
+        try:
+            return json.loads(sanitized)
+        except json.JSONDecodeError:
+            pass
+    
+    # Strategy 3: Try direct parse of the full content
+    sanitized = _sanitize_json_string(content)
+    try:
+        return json.loads(sanitized)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 4: Line-by-line recovery — extract individual {"question":..., "answer":...} objects
+    pairs = []
+    for obj_match in re.finditer(r'\{[^{}]*?"question"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"answer"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}', content, re.DOTALL):
+        try:
+            q = obj_match.group(1).replace('\\n', ' ').replace('\\t', ' ').strip()
+            a = obj_match.group(2).replace('\\n', ' ').replace('\\t', ' ').strip()
+            if q and a:
+                pairs.append({"question": q, "answer": a})
+        except Exception:
+            continue
+    
+    return pairs if pairs else None
+
+
 def generate_qa_from_text(text, model_name="ministral-3:8b"):
     prompt = f"""
 You are an expert AI dataset creator. Based on the following document, generate a list of high-quality Question/Answer pairs to be used for fine-tuning an AI model.
@@ -18,7 +107,8 @@ You are an expert AI dataset creator. Based on the following document, generate 
 CRITICAL RULES:
 1. Generate specific, detailed questions that require understanding the document. Avoid generic questions.
 2. The answers must be self-contained and comprehensive.
-3. Provide the output STRICTLY as a JSON array of objects. Do not write any other text or markdown block formatting.
+3. Keep answers in plain text. Do NOT include code blocks, markdown formatting, or newlines inside answers.
+4. Provide the output STRICTLY as a JSON array of objects. Do not write any other text or markdown block formatting.
 Format:
 [
   {{"question": "What is X?", "answer": "X is Y because Z."}},
@@ -37,16 +127,23 @@ Document text:
         ])
         
         content = response['message']['content']
-        # Try to extract JSON array using regex if the LLM added markdown formatting like ```json
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            return json.loads(json_str)
-        else:
-            return json.loads(content)
+        
+        parsed = _try_parse_json(content)
+        
+        if parsed is None:
+            tqdm.write(f"  [WARNING] Could not parse JSON from AI response. Raw preview: {content[:200]}")
+            log_error("N/A", f"JSON parse failed. Raw response: {content[:500]}")
+            return []
+        
+        if not isinstance(parsed, list):
+            tqdm.write(f"  [WARNING] AI returned non-list type: {type(parsed)}")
+            return []
+            
+        return parsed
             
     except Exception as e:
-        # Silently fail for a single document, return empty list
+        tqdm.write(f"  [ERROR] Ollama call failed: {e}")
+        log_error("N/A", f"Ollama exception: {e}")
         return []
 
 def deduplicate_qa(qa_list, threshold=0.85):
@@ -84,6 +181,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
     print(f"Found {len(files_to_process)} Markdown files to process for Q&A generation.")
     
     all_qa_pairs = []
+    failed_files = 0
     pbar = tqdm(files_to_process, desc="Generating Q&A", unit="file")
          
     for input_path in pbar:
@@ -104,20 +202,34 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
             qa_pairs = generate_qa_from_text(text, model_name=model_name)
             
             if isinstance(qa_pairs, list):
+                file_count = 0
                 for qa in qa_pairs:
                     if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
                         all_qa_pairs.append({
                             "question": qa['question'],
                             "answer": qa['answer']
                         })
+                        file_count += 1
+                if file_count == 0:
+                    failed_files += 1
+                    tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
             else:
+                failed_files += 1
                 log_error(input_path, "AI did not return a valid list of QA pairs.")
         except Exception as e:
+            failed_files += 1
             log_error(input_path, f"Unexpected exception: {str(e)}")
+            tqdm.write(f"  [{filename}] Error: {str(e)}")
             continue
 
     # Deduplication phase
-    print(f"\nPhase 1 Complete. Generated {len(all_qa_pairs)} initial Q&A pairs.")
+    print(f"\nPhase 1 Complete. Generated {len(all_qa_pairs)} initial Q&A pairs ({failed_files} files had issues).")
+    
+    if not all_qa_pairs:
+        print("ERROR: No Q&A pairs were generated at all! Check error.log for details.")
+        print("Common causes: Ollama not running, model not available, or all AI responses were unparseable.")
+        return
+    
     print("Phase 2: Removing duplicates (similarity threshold 85%)...")
     unique_qa_pairs = deduplicate_qa(all_qa_pairs, threshold=0.85)
     
