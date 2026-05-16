@@ -8,7 +8,7 @@
 
 **Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, HTML) including scanned images via Tesseract OCR. Using local Large Language Models (LLMs) via **Ollama**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
 
-## Why Dataminder? (Highlights)
+## Why Dataminder?
 - **100% Offline & Private:** No API keys, no cloud data leaks. Everything runs locally on your machine.
 - **Automated ML Dataset Creation:** Seamlessly converts unstructured local documents into deduplicated Alpaca JSON datasets for AI training.
 - **Smart OCR Fallback:** Automatically detects scanned PDFs/images and switches to Tesseract OCR.
@@ -19,7 +19,7 @@
 
 ## Prerequisites
 
-- Linux (Ubuntu/Debian for the installation script)
+- Linux (Ubuntu/Debian) or macOS
 - Python 3.8+
 - [Ollama](https://ollama.com/) installed and running locally.
 - An Ollama model downloaded (e.g., `ministral-3:8b`, `mistral`). To download a model, run in your terminal: `ollama pull ministral-3:8b`.
@@ -64,18 +64,22 @@ Here are the most common commands you will need:
   ```bash
   python main.py --source ./my_files --dest ./my_summaries --model llama3
   ```
+- **Adjust Summarization Level:** Control the summary length from 1 (brief) to 10 (exhaustive). 0 saves the raw text without AI processing:
+  ```bash
+  python main.py --level 3
+  ```
 
 ### Detailed Commands
 
 2. **Run the processing**:
-   The script can be run without any arguments. By default, it looks for documents in the `source` directory, saves the summaries in the `destination` directory, and uses the `ministral-3:8b` model.
+   The script can be run without any arguments. By default, it looks for documents in the `source` directory, saves the summaries in the `destination` directory, uses the `ministral-3:8b` model, and applies a summarization level of `7`.
    ```bash
    python main.py
    ```
    
    You can customize this behavior using command line arguments:
    ```bash
-   python main.py --source ./my_documents --dest ./my_summaries --model llama3
+   python main.py --source ./my_documents --dest ./my_summaries --model llama3 --level 10
    ```
    
    The output files will keep their original name but with a `.md` extension (e.g., `document.md`). If a summary already exists for a file, it will automatically be skipped, which makes resuming interrupted jobs easy!

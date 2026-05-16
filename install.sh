@@ -4,10 +4,23 @@ echo "=========================================="
 echo "Dataminder Dependencies Installation"
 echo "=========================================="
 
-echo -e "\n[1/2] Installing system packages (requires administrator rights)..."
-# Requests sudo rights if necessary
-sudo apt-get update
-sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra poppler-utils antiword libchm-bin
+OS="$(uname -s)"
+echo -e "\n[1/3] Installing system packages..."
+if [ "$OS" = "Linux" ]; then
+    echo "Linux detected. Using apt-get (requires administrator rights)..."
+    sudo apt-get update
+    sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra poppler-utils antiword libchm-bin
+elif [ "$OS" = "Darwin" ]; then
+    echo "macOS detected. Using Homebrew..."
+    if ! command -v brew &> /dev/null; then
+        echo "Error: Homebrew is not installed. Please install Homebrew first (https://brew.sh/)."
+        exit 1
+    fi
+    brew install tesseract tesseract-lang poppler antiword chmlib
+else
+    echo "Unsupported OS: $OS. Please install dependencies manually."
+    exit 1
+fi
 
 echo -e "\n[2/3] Installing Python packages (Virtual Environment)..."
 # Checks if the venv folder exists, creates it otherwise

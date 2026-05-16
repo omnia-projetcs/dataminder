@@ -10,7 +10,7 @@ def log_error(filepath, error_msg):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] FILE: {filepath} | PIPELINE ERROR: {error_msg}\n")
 
-def process_documents(source_dir, dest_dir, model_name):
+def process_documents(source_dir, dest_dir, model_name, level=7):
     if not os.path.exists(source_dir):
         print(f"Source directory '{source_dir}' does not exist. Creating it now...")
         os.makedirs(source_dir, exist_ok=True)
@@ -53,8 +53,12 @@ def process_documents(source_dir, dest_dir, model_name):
                 log_error(input_path, "No text extracted (unsupported or OCR failed).")
                 continue
                 
-            pbar.set_postfix({"file": filename[:20], "step": "AI Summarizing"})
-            summary_md = summarize_text(text, model_name=model_name)
+            if level == 0:
+                pbar.set_postfix({"file": filename[:20], "step": "Saving Raw Text"})
+                summary_md = text
+            else:
+                pbar.set_postfix({"file": filename[:20], "step": f"AI Summarizing (L{level})"})
+                summary_md = summarize_text(text, model_name=model_name, level=level)
             
             pbar.set_postfix({"file": filename[:20], "step": "Saving"})
             with open(output_path, "w", encoding="utf-8") as f:
@@ -71,6 +75,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", default="source", help="Source directory containing the documents to process (default: source).")
     parser.add_argument("--dest", default="destination", help="Destination directory for the Markdown summaries (default: destination).")
     parser.add_argument("--model", default="ministral-3:8b", help="Ollama model to use (default: ministral-3:8b).")
+    parser.add_argument("--level", type=int, default=7, help="Summarization detail level from 1 to 10. 0 means no summarization (saves raw text). Default: 7.")
     parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
     
@@ -80,7 +85,7 @@ if __name__ == "__main__":
         from qa_generator import generate_qa_dataset
         print("--- Starting FULL Pipeline ---")
         print("\n[Step 1/2] Document Processing")
-        process_documents(args.source, args.dest, args.model)
+        process_documents(args.source, args.dest, args.model, args.level)
         
         print("\n[Step 2/2] Q&A Dataset Generation")
         qa_dest = "dataresults" if args.dest == "destination" else f"{args.dest}_qa"
@@ -97,4 +102,4 @@ if __name__ == "__main__":
         generate_qa_dataset(qa_source, qa_dest, args.model)
     else:
         print("--- Starting document processing ---")
-        process_documents(args.source, args.dest, args.model)
+        process_documents(args.source, args.dest, args.model, args.level)

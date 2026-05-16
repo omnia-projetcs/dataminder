@@ -1,8 +1,22 @@
 import ollama
 
-def summarize_text(text, model_name="ministral-3:8b"):
+def summarize_text(text, model_name="ministral-3:8b", level=7):
     if not text or not text.strip():
         return "No text provided for summarization."
+
+    # Adjust instruction based on level
+    if level < 1:
+        level = 1
+    elif level > 10:
+        level = 10
+        
+    length_instruction = f"The desired detail level for the summary is {level} out of 10. "
+    if level <= 3:
+        length_instruction += "Make it extremely brief, concise, and straight to the point. Only the most critical information."
+    elif level <= 7:
+        length_instruction += "Provide a balanced, detailed summary covering all main points."
+    else:
+        length_instruction += "Make it highly exhaustive and comprehensive. Do not leave out any details, provide an extensive summary."
 
     # Prompt definition
     prompt = f"""
@@ -10,7 +24,7 @@ Here is the content of a document.
 
 Your tasks are:
 1. Detect the original language of the document and state it at the beginning.
-2. Provide a detailed summary of this text in ENGLISH.
+2. Provide a summary of this text in ENGLISH. {length_instruction}
 3. Translate all prose and descriptive text to ENGLISH.
 4. CRITICAL: You must preserve any code blocks, scripts, or terminal commands EXACTLY as they appear in the original text. Do not translate code syntax, variable names, or commands.
 
