@@ -13,6 +13,7 @@ _TRAILING_SECTIONS_RE = re.compile(
     r'resources|references|sources|bibliography|links|contact'
     r'|further (?:reading|learning)|next steps|to help me'
     r'|additional (?:resources|notes|considerations)'
+    r'|in summary|summary|conclusion|key takeaways'
     r')(?:\*{2})?[:\s].*',
     re.DOTALL | re.IGNORECASE
 )
