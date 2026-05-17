@@ -100,7 +100,7 @@ def _try_parse_json(content):
     return pairs if pairs else None
 
 
-def generate_qa_from_text(text, model_name="qwen3.5:9b"):
+def generate_qa_from_text(text, model_name="gemma3:4b", source_file="N/A"):
     prompt = f"""
 You are an expert AI dataset creator specializing in technical cybersecurity and IT training data. Based on the following document, generate a list of high-quality Question/Answer pairs for fine-tuning an AI model. Prioritize technical, hands-on questions but also include conceptual questions when the content warrants it.
 
@@ -134,7 +134,7 @@ Document text:
         
         if parsed is None:
             tqdm.write(f"  [WARNING] Could not parse JSON from AI response. Raw preview: {content[:200]}")
-            log_error("N/A", f"JSON parse failed. Raw response: {content[:500]}")
+            log_error(source_file, f"JSON parse failed. Raw response: {content[:500]}")
             return []
         
         if not isinstance(parsed, list):
@@ -145,7 +145,7 @@ Document text:
             
     except Exception as e:
         tqdm.write(f"  [ERROR] Ollama call failed: {e}")
-        log_error("N/A", f"Ollama exception: {e}")
+        log_error(source_file, f"Ollama exception: {e}")
         return []
 
 # Regex patterns that detect references to source books/documents/authors
@@ -274,7 +274,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
                 # Limit text size if it's too huge to prevent context blowup
                 text = text[:20000] 
                     
-                qa_pairs = generate_qa_from_text(text, model_name=model_name)
+                qa_pairs = generate_qa_from_text(text, model_name=model_name, source_file=input_path)
                 
                 if isinstance(qa_pairs, list):
                     file_count = 0

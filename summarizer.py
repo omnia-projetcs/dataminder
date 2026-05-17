@@ -1,6 +1,6 @@
 import ollama
 
-def summarize_text(text, model_name="qwen3.5:9b", level=7):
+def summarize_text(text, model_name="gemma3:4b", level=7):
     if not text or not text.strip():
         return "No text provided for summarization."
 
@@ -19,24 +19,28 @@ def summarize_text(text, model_name="qwen3.5:9b", level=7):
         length_instruction += "Make it highly exhaustive and comprehensive. Do not leave out any details, provide an extensive summary."
 
     # Prompt definition
-    prompt = f"""
-Here is the content of a document. 
+    prompt = f"""You are a technical knowledge extractor. Your job is to read the following document and extract ALL concrete, useful knowledge from it.
 
-Your tasks are:
-1. Detect the original language of the document and state it at the beginning.
-2. Provide a summary of this text in ENGLISH. {length_instruction}
-3. Translate all prose and descriptive text to ENGLISH.
-4. CRITICAL: You must preserve any code blocks, scripts, or terminal commands EXACTLY as they appear in the original text. Do not translate code syntax, variable names, or commands.
-5. CRITICAL: NEVER reference the source document, book, author, chapter, or publication in your summary. Do NOT write things like "this book explains...", "the author describes...", "in chapter 3...", "according to the document...". Write the knowledge directly as standalone facts, as if you are teaching the subject yourself.
+{length_instruction}
 
-Structure your response in Markdown format.
+RULES:
+1. Write everything in ENGLISH regardless of the source language.
+2. Extract ONLY real knowledge: technical facts, definitions, commands, tools, techniques, configurations, protocols, procedures, code examples, specific values, parameters, attack methods, defense strategies, etc.
+3. Preserve code blocks, scripts, commands, and terminal output EXACTLY as they appear. Do not translate code.
+4. Write the knowledge as standalone facts, as if you are a technical instructor teaching the subject.
 
-Document text:
+FORBIDDEN — Do NOT include any of the following:
+- Document metadata: title, author, publisher, ISBN, edition, publication date
+- Structural descriptions: "Purpose and Philosophy", "Target Audience", "Document Structure", "Learning Objectives", "Prerequisites", "Overview of the book"
+- Meta-references: "this book explains...", "the author describes...", "in chapter 3...", "according to the document..."
+- Generic filler: "security is important", "cybersecurity is a growing field"
+
+Structure the output in Markdown using technical topic headings.
+
+Document:
 ---
 {text}
 ---
-
-Analysis and Summary (in English):
 """
 
     try:

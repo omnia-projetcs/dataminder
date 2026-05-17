@@ -74,7 +74,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
     parser.add_argument("--source", default="source", help="Source directory containing the documents to process (default: source).")
     parser.add_argument("--dest", default="destination", help="Destination directory for the Markdown summaries (default: destination).")
-    parser.add_argument("--model", default="qwen3.5:9b", help="Ollama model to use (default: qwen3.5:9b).")
+    parser.add_argument("--model", default="gemma3:4b", help="Ollama model to use (default: gemma3:4b).")
     parser.add_argument("--level", type=int, default=7, help="Summarization detail level from 1 to 10. 0 means no summarization (saves raw text). Default: 7.")
     parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
