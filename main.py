@@ -1,4 +1,5 @@
 import os
+import time
 import argparse
 import ollama
 from datetime import datetime
@@ -108,17 +109,30 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False):
 
                 if len(chunks) <= 1:
                     pbar.set_postfix({"file": filename[:20], "step": f"AI Summarizing (L{level})"})
+                    t0 = time.time()
                     summary_md = summarize_text(text, model_name=model_name, level=level)
+                    elapsed = time.time() - t0
+                    tqdm.write(f"  [{filename}] 1 chunk — {elapsed:.1f}s")
                 else:
                     summaries = []
+                    chunk_times = []
                     for idx, chunk in enumerate(chunks):
                         if not chunk.strip():
                             continue
                         pbar.set_postfix({"file": filename[:20], "step": f"AI Sum {idx+1}/{len(chunks)}"})
+                        t0 = time.time()
                         chunk_sum = summarize_text(chunk, model_name=model_name, level=level)
+                        elapsed = time.time() - t0
+                        chunk_times.append(elapsed)
+                        pbar.set_postfix({"file": filename[:20], "step": f"AI Sum {idx+1}/{len(chunks)} [{elapsed:.1f}s]"})
                         if chunk_sum:
                             summaries.append(chunk_sum)
                     summary_md = "\n\n".join(summaries)
+                    # Print per-chunk timing summary
+                    details = " | ".join([f"C{i+1}:{t:.1f}s" for i, t in enumerate(chunk_times)])
+                    total_t = sum(chunk_times)
+                    avg_t = total_t / len(chunk_times) if chunk_times else 0
+                    tqdm.write(f"  [{filename}] {len(chunk_times)} chunks — {details} | Total: {total_t:.1f}s | Avg: {avg_t:.1f}s/chunk")
             
             pbar.set_postfix({"file": filename[:20], "step": "Saving"})
             with open(output_path, "w", encoding="utf-8") as f:
