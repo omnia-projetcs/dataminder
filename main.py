@@ -67,8 +67,40 @@ def process_documents(source_dir, dest_dir, model_name, level=7):
                 pbar.set_postfix({"file": filename[:20], "step": "Saving Raw Text"})
                 summary_md = text
             else:
-                pbar.set_postfix({"file": filename[:20], "step": f"AI Summarizing (L{level})"})
-                summary_md = summarize_text(text, model_name=model_name, level=level)
+                # Split text into chunks to prevent context blowup for large documents
+                chunk_size = 20000
+                chunks = []
+                start = 0
+                while start < len(text):
+                    if len(text) - start <= chunk_size:
+                        chunks.append(text[start:])
+                        break
+                    
+                    # Try to find a paragraph break to split cleanly
+                    split_point = text.rfind('\n\n', start, start + chunk_size)
+                    if split_point == -1 or split_point <= start:
+                        # Fallback to newline
+                        split_point = text.rfind('\n', start, start + chunk_size)
+                    if split_point == -1 or split_point <= start:
+                        # Fallback to hard split
+                        split_point = start + chunk_size
+                        
+                    chunks.append(text[start:split_point].strip())
+                    start = split_point
+
+                if len(chunks) <= 1:
+                    pbar.set_postfix({"file": filename[:20], "step": f"AI Summarizing (L{level})"})
+                    summary_md = summarize_text(text, model_name=model_name, level=level)
+                else:
+                    summaries = []
+                    for idx, chunk in enumerate(chunks):
+                        if not chunk.strip():
+                            continue
+                        pbar.set_postfix({"file": filename[:20], "step": f"AI Sum {idx+1}/{len(chunks)}"})
+                        chunk_sum = summarize_text(chunk, model_name=model_name, level=level)
+                        if chunk_sum:
+                            summaries.append(chunk_sum)
+                    summary_md = "\n\n".join(summaries)
             
             pbar.set_postfix({"file": filename[:20], "step": "Saving"})
             with open(output_path, "w", encoding="utf-8") as f:
