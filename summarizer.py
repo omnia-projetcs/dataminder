@@ -36,6 +36,7 @@ FORBIDDEN — Do NOT include any of the following:
 - Structural descriptions: "Purpose and Philosophy", "Target Audience", "Document Structure", "Learning Objectives", "Prerequisites", "Overview of the book"
 - Meta-references: "this book explains...", "the author describes...", "in chapter 3...", "according to the document..."
 - Generic filler: "security is important", "cybersecurity is a growing field"
+- Resources/References sections: URLs, links, contact information, email addresses, social media, "for more information visit...", recommended readings, bibliographies
 
 Structure the output in Markdown using technical topic headings.
 
@@ -51,7 +52,7 @@ Document:
                 'role': 'user',
                 'content': prompt
             }
-        ])
+        ], keep_alive=-1)
         return response['message']['content']
     except Exception as e:
         print(f"Error communicating with Ollama: {e}")

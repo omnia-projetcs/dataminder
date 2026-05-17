@@ -6,6 +6,15 @@ import ollama
 import difflib
 import datetime
 
+def _unload_model(model_name):
+    """Send a dummy request with keep_alive=0 to unload the model from VRAM."""
+    try:
+        ollama.chat(model=model_name, messages=[
+            {'role': 'user', 'content': '.'}
+        ], keep_alive=0)
+    except Exception:
+        pass
+
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -126,7 +135,7 @@ Document text:
     try:
         response = ollama.chat(model=model_name, messages=[
             {'role': 'user', 'content': prompt}
-        ])
+        ], keep_alive=-1)
         
         content = response['message']['content']
         
@@ -359,3 +368,6 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
     print(f"Saved JSON dataset to: {dataset_json_path}")
     print(f"Saved Markdown readable dataset to: {dataset_md_path}")
     print(f"Raw data preserved in: {raw_jsonl_path}")
+
+    # Unload model from VRAM now that processing is complete
+    _unload_model(model_name)

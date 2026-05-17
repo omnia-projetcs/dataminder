@@ -1,9 +1,19 @@
 import os
 import argparse
+import ollama
 from datetime import datetime
 from extractor import extract_text
 from summarizer import summarize_text
 from tqdm import tqdm
+
+def _unload_model(model_name):
+    """Send a dummy request with keep_alive=0 to unload the model from VRAM."""
+    try:
+        ollama.chat(model=model_name, messages=[
+            {'role': 'user', 'content': '.'}
+        ], keep_alive=0)
+    except Exception:
+        pass
 
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
@@ -69,6 +79,9 @@ def process_documents(source_dir, dest_dir, model_name, level=7):
             tqdm.write(f"\n[{filename}] Failed with error: {error_details}")
             log_error(input_path, f"Unexpected exception: {error_details}")
             continue
+
+    # Unload model from VRAM now that processing is complete
+    _unload_model(model_name)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
