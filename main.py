@@ -6,6 +6,8 @@ from extractor import extract_text
 from summarizer import summarize_text
 from tqdm import tqdm
 
+CHUNK_SIZE = 5000
+
 def _unload_model(model_name):
     """Send a dummy request with keep_alive=0 to unload the model from VRAM."""
     try:
@@ -68,22 +70,21 @@ def process_documents(source_dir, dest_dir, model_name, level=7):
                 summary_md = text
             else:
                 # Split text into chunks to prevent context blowup for large documents
-                chunk_size = 20000
                 chunks = []
                 start = 0
                 while start < len(text):
-                    if len(text) - start <= chunk_size:
+                    if len(text) - start <= CHUNK_SIZE:
                         chunks.append(text[start:])
                         break
                     
                     # Try to find a paragraph break to split cleanly
-                    split_point = text.rfind('\n\n', start, start + chunk_size)
+                    split_point = text.rfind('\n\n', start, start + CHUNK_SIZE)
                     if split_point == -1 or split_point <= start:
                         # Fallback to newline
-                        split_point = text.rfind('\n', start, start + chunk_size)
+                        split_point = text.rfind('\n', start, start + CHUNK_SIZE)
                     if split_point == -1 or split_point <= start:
                         # Fallback to hard split
-                        split_point = start + chunk_size
+                        split_point = start + CHUNK_SIZE
                         
                     chunks.append(text[start:split_point].strip())
                     start = split_point
