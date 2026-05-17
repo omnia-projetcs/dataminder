@@ -10,13 +10,15 @@ def summarize_text(text, model_name="gemma3:4b", level=7):
     elif level > 10:
         level = 10
         
-    length_instruction = f"The desired detail level for the summary is {level} out of 10. "
-    if level <= 3:
-        length_instruction += "Make it extremely brief, concise, and straight to the point. Only the most critical information."
-    elif level <= 7:
-        length_instruction += "Provide a balanced, detailed summary covering all main points."
+    length_instruction = f"The desired detail level is {level} out of 10. "
+    if level <= 2:
+        length_instruction += "Make it extremely brief and concise. Only the most critical information."
+    elif level <= 5:
+        length_instruction += "Provide a balanced summary covering main points."
+    elif level <= 8:
+        length_instruction += "Provide a detailed and thorough extraction. Include all important technical details, examples, and specifics."
     else:
-        length_instruction += "Make it highly exhaustive and comprehensive. Do not leave out any details, provide an extensive summary."
+        length_instruction += "Be MAXIMALLY exhaustive. Extract EVERY piece of knowledge, every detail, every example, every command, every configuration. Do not omit anything. The output should be as long and complete as possible."
 
     # Prompt definition
     prompt = f"""You are a technical knowledge extractor. Your job is to read the following document and extract ALL concrete, useful knowledge from it.
