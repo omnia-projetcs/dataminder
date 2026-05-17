@@ -170,7 +170,7 @@ def extract_text_from_epub(path):
 def extract_text(path):
     ext = os.path.splitext(path)[1].lower()
     
-    if ext in ['.txt', '.md']:
+    if ext in ['.txt', '.md', '.rst']:
         return extract_text_from_txt(path)
     elif ext == '.docx':
         return extract_text_from_docx(path)
