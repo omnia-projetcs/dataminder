@@ -22,7 +22,7 @@ def log_error(filepath, error_msg):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] FILE: {filepath} | PIPELINE ERROR: {error_msg}\n")
 
-def process_documents(source_dir, dest_dir, model_name, level=7):
+def process_documents(source_dir, dest_dir, model_name, level=7, force=False):
     if not os.path.exists(source_dir):
         print(f"Source directory '{source_dir}' does not exist. Creating it now...")
         os.makedirs(source_dir, exist_ok=True)
@@ -41,7 +41,27 @@ def process_documents(source_dir, dest_dir, model_name, level=7):
         print(f"No supported documents (txt, md, rst, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm, epub) found in '{source_dir}'.")
         return
         
-    print(f"Found {len(files_to_process)} documents to process.")
+    # Resume: filter out already processed files unless --force
+    skipped = 0
+    if not force:
+        filtered = []
+        for fp in files_to_process:
+            base_name, _ = os.path.splitext(os.path.basename(fp))
+            output_path = os.path.join(dest_dir, f"{base_name}.md")
+            if os.path.exists(output_path):
+                skipped += 1
+            else:
+                filtered.append(fp)
+        files_to_process = filtered
+    
+    if skipped:
+        print(f"Resuming: {skipped} files already processed (use --force to reprocess). {len(files_to_process)} remaining.")
+    
+    if not files_to_process:
+        print("All files already processed. Nothing to do.")
+        return
+    
+    print(f"Processing {len(files_to_process)} documents...")
     
     pbar = tqdm(files_to_process, desc="Processing", unit="doc")
     for input_path in pbar:
@@ -53,9 +73,6 @@ def process_documents(source_dir, dest_dir, model_name, level=7):
         output_path = os.path.join(dest_dir, output_filename)
         
         try:
-            # Skip if already processed
-            if os.path.exists(output_path):
-                continue
                 
             pbar.set_postfix({"file": filename[:20], "step": "Extracting text"})
             text = extract_text(input_path)
@@ -124,6 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--level", type=int, default=9, help="Summarization detail level from 1 to 10. 0 means no summarization (saves raw text). Default: 9.")
     parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
+    parser.add_argument("--force", action="store_true", help="Force reprocessing of all files, ignoring resume state.")
     
     args = parser.parse_args()
     
@@ -131,7 +149,7 @@ if __name__ == "__main__":
         from qa_generator import generate_qa_dataset
         print("--- Starting FULL Pipeline ---")
         print("\n[Step 1/2] Document Processing")
-        process_documents(args.source, args.dest, args.model, args.level)
+        process_documents(args.source, args.dest, args.model, args.level, force=args.force)
         
         print("\n[Step 2/2] Q&A Dataset Generation")
         qa_dest = "dataresults" if args.dest == "destination" else f"{args.dest}_qa"
@@ -148,4 +166,4 @@ if __name__ == "__main__":
         generate_qa_dataset(qa_source, qa_dest, args.model)
     else:
         print("--- Starting document processing ---")
-        process_documents(args.source, args.dest, args.model, args.level)
+        process_documents(args.source, args.dest, args.model, args.level, force=args.force)
