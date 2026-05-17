@@ -41,7 +41,7 @@ pip install -r requirements.txt
 
 echo -e "\n[3/3] Downloading the Ollama model (qwen3.5:9b)..."
 echo "Please make sure Ollama is running in the background or another terminal."
-ollama pull qwen3.5:9b || echo "Failed to pull the model. You can run 'ollama pull qwen3.5:9b' manually later."
+ollama pull gemma3:12b || echo "Failed to pull the model. You can run 'ollama pull gemma3:12b' manually later."
 
 echo -e "\n=========================================="
 echo "Installation completed successfully!"
