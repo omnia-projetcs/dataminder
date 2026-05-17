@@ -119,7 +119,8 @@ CRITICAL RULES:
 3. Answers must be self-contained, precise, and technically accurate. Include specific values, commands, paths, or configurations when relevant.
 4. Keep answers in plain text. Do NOT include code blocks, markdown formatting, or newlines inside answers.
 5. NEVER reference the source document, book, author, chapter, or publication. Write questions and answers as standalone technical knowledge.
-6. Provide the output STRICTLY as a JSON array of objects. No other text.
+6. Be EXHAUSTIVE. Extract as many relevant, high-quality Question/Answer pairs as possible from the provided text. Ensure no important technical details, configurations, or concepts are omitted.
+7. Provide the output STRICTLY as a JSON array of objects. No other text.
 Format:
 [
   {{"question": "What is X?", "answer": "X is Y because Z."}},
@@ -131,6 +132,7 @@ Document text:
 {text}
 ---
 """
+
 
     try:
         response = ollama.chat(model=model_name, messages=[
@@ -280,11 +282,38 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
                     log_error(input_path, "File is empty.")
                     continue
                     
-                # Limit text size if it's too huge to prevent context blowup
-                text = text[:20000] 
+                # Split text into chunks to prevent context blowup while processing entire files
+                chunk_size = 20000
+                chunks = []
+                start = 0
+                while start < len(text):
+                    if len(text) - start <= chunk_size:
+                        chunks.append(text[start:])
+                        break
                     
-                qa_pairs = generate_qa_from_text(text, model_name=model_name, source_file=input_path)
+                    # Try to find a paragraph break to split cleanly
+                    split_point = text.rfind('\n\n', start, start + chunk_size)
+                    if split_point == -1 or split_point <= start:
+                        # Fallback to newline
+                        split_point = text.rfind('\n', start, start + chunk_size)
+                    if split_point == -1 or split_point <= start:
+                        # Fallback to hard split
+                        split_point = start + chunk_size
+                        
+                    chunks.append(text[start:split_point].strip())
+                    start = split_point
                 
+                qa_pairs = []
+                for chunk_idx, chunk in enumerate(chunks):
+                    if not chunk:
+                        continue
+                    if len(chunks) > 1:
+                        pbar.set_postfix({"file": filename[:20], "chunk": f"{chunk_idx+1}/{len(chunks)}", "q_saved": total_saved})
+                    
+                    chunk_pairs = generate_qa_from_text(chunk, model_name=model_name, source_file=input_path)
+                    if isinstance(chunk_pairs, list):
+                        qa_pairs.extend(chunk_pairs)
+                                
                 if isinstance(qa_pairs, list):
                     file_count = 0
                     filtered_count = 0
