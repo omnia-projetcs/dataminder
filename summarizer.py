@@ -1,6 +1,6 @@
 import ollama
 
-def summarize_text(text, model_name="gemma3:4b", level=7):
+def summarize_text(text, model_name="gemma3:12b", level=7):
     if not text or not text.strip():
         return "No text provided for summarization."
 

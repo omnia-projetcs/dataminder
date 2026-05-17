@@ -100,7 +100,7 @@ def _try_parse_json(content):
     return pairs if pairs else None
 
 
-def generate_qa_from_text(text, model_name="gemma3:4b", source_file="N/A"):
+def generate_qa_from_text(text, model_name="gemma3:12b", source_file="N/A"):
     prompt = f"""
 You are an expert AI dataset creator specializing in technical cybersecurity and IT training data. Based on the following document, generate a list of high-quality Question/Answer pairs for fine-tuning an AI model. Prioritize technical, hands-on questions but also include conceptual questions when the content warrants it.
 
