@@ -22,7 +22,7 @@
 - Linux (Ubuntu/Debian) or macOS
 - Python 3.8+
 - [Ollama](https://ollama.com/) installed and running locally.
-- An Ollama model downloaded (e.g., `qwen3.5:9b`, `mistral`). To download a model, run in your terminal: `ollama pull qwen3.5:9b`.
+- An Ollama model downloaded (e.g., `gemma3:12b`, `mistral`). To download a model, run in your terminal: `ollama pull gemma3:12b`.
 
 ## Installation
 
@@ -78,7 +78,7 @@ Here are the most common commands you will need:
 ### Detailed Commands
 
 2. **Run the processing**:
-   The script can be run without any arguments. By default, it looks for documents in the `source` directory, saves the summaries in the `destination` directory, uses the `qwen3.5:9b` model, and applies a summarization level of `7`.
+   The script can be run without any arguments. By default, it looks for documents in the `source` directory, saves the summaries in the `destination` directory, uses the `gemma3:12b` model, and applies a summarization level of `7`.
    ```bash
    python main.py
    ```
