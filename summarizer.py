@@ -56,6 +56,7 @@ def summarize_text(text, model_name="gemma3:12b", level=7):
     system_prompt = (
         "You are a silent technical knowledge extractor. You are NOT a chatbot. "
         "You NEVER talk to the user. You NEVER ask questions. You NEVER add commentary. "
+        "You NEVER review or describe the document itself. "
         "You output ONLY structured Markdown containing extracted technical knowledge. "
         "No preamble, no introduction, no conclusion, no suggestions, no questions. "
         "Start directly with the first technical heading."
@@ -71,11 +72,13 @@ RULES:
 4. Write the knowledge as standalone facts, as if you are a technical instructor teaching the subject.
 5. Start IMMEDIATELY with a Markdown heading. No introductory text, no preamble, no "here is...".
 6. End with the last piece of technical knowledge. Nothing after it.
+7. PROGRESSIVE EXTRACTION: Process the text sequentially from start to finish. Extract the actual technical elements one by one in detail. DO NOT provide a high-level summary of what the document is (e.g., do not say "This is a massive list of tools" or "Overall Observations"). Detail the technical elements themselves.
 
 FORBIDDEN — Do NOT include any of the following:
+- "Overall Observations", "General Summary", or any commentary on the document's nature, age, or quality.
 - Document metadata: title, author, publisher, ISBN, edition, publication date
 - Structural descriptions: "Purpose and Philosophy", "Target Audience", "Document Structure", "Learning Objectives", "Prerequisites", "Overview of the book"
-- Meta-references: "this book explains...", "the author describes...", "in chapter 3...", "according to the document..."
+- Meta-references: "this book explains...", "the author describes...", "in chapter 3...", "according to the document...", "this list contains..."
 - Generic filler: "security is important", "cybersecurity is a growing field"
 - Resources/References/Sources sections: URLs, links, contact information, email addresses, phone numbers, social media, "for more information visit...", recommended readings, bibliographies
 - Next steps, further learning, suggestions, advice, or recommendations
