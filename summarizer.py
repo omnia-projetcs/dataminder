@@ -1,5 +1,5 @@
-import ollama
 import re
+from llm_client import LLMClient
 
 # Pattern to strip conversational preamble (e.g. "Okay, here's a breakdown...")
 _PREAMBLE_RE = re.compile(
@@ -33,9 +33,12 @@ def _clean_output(text):
     return text.strip()
 
 
-def summarize_text(text, model_name="gemma3:12b", level=7):
+def summarize_text(text, model_name="gemma3:12b", level=7, llm_client=None):
     if not text or not text.strip():
         return "No text provided for summarization."
+
+    if llm_client is None:
+        llm_client = LLMClient(provider="ollama")
 
     # Adjust instruction based on level
     if level < 1:
@@ -94,17 +97,15 @@ Document:
 """
 
     try:
-        response = ollama.chat(model=model_name, messages=[
-            {
-                'role': 'system',
-                'content': system_prompt
-            },
-            {
-                'role': 'user',
-                'content': prompt
-            }
-        ], keep_alive=-1)
-        return _clean_output(response['message']['content'])
+        content = llm_client.chat(
+            model=model_name,
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': prompt}
+            ],
+            keep_alive=-1
+        )
+        return _clean_output(content)
     except Exception as e:
-        print(f"Error communicating with Ollama: {e}")
-        return f"Error during summarization: {e}\n\nCheck that the Ollama server is running and the model '{model_name}' is available."
+        print(f"Error communicating with LLM ({llm_client}): {e}")
+        return f"Error during summarization: {e}\n\nCheck that your LLM server is running and the model '{model_name}' is available."

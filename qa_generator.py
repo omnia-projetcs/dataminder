@@ -2,20 +2,11 @@ import os
 import json
 import re
 from tqdm import tqdm
-import ollama
 import difflib
 import datetime
+from llm_client import LLMClient
 
 CHUNK_SIZE = 5000
-
-def _unload_model(model_name):
-    """Send a dummy request with keep_alive=0 to unload the model from VRAM."""
-    try:
-        ollama.chat(model=model_name, messages=[
-            {'role': 'user', 'content': '.'}
-        ], keep_alive=0)
-    except Exception:
-        pass
 
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
@@ -111,7 +102,10 @@ def _try_parse_json(content):
     return pairs if pairs else None
 
 
-def generate_qa_from_text(text, model_name="gemma3:12b", source_file="N/A"):
+def generate_qa_from_text(text, model_name="gemma3:12b", source_file="N/A", llm_client=None):
+    if llm_client is None:
+        llm_client = LLMClient(provider="ollama")
+
     prompt = f"""
 You are an expert AI dataset creator specializing in technical cybersecurity and IT training data. Based on the following document, generate a list of high-quality Question/Answer pairs for fine-tuning an AI model. Prioritize technical, hands-on questions but also include conceptual questions when the content warrants it.
 
@@ -137,11 +131,11 @@ Document text:
 
 
     try:
-        response = ollama.chat(model=model_name, messages=[
-            {'role': 'user', 'content': prompt}
-        ], keep_alive=-1)
-        
-        content = response['message']['content']
+        content = llm_client.chat(
+            model=model_name,
+            messages=[{'role': 'user', 'content': prompt}],
+            keep_alive=-1
+        )
         
         parsed = _try_parse_json(content)
         
@@ -157,8 +151,8 @@ Document text:
         return parsed
             
     except Exception as e:
-        tqdm.write(f"  [ERROR] Ollama call failed: {e}")
-        log_error(source_file, f"Ollama exception: {e}")
+        tqdm.write(f"  [ERROR] LLM call failed: {e}")
+        log_error(source_file, f"LLM exception: {e}")
         return []
 
 # Regex patterns that detect references to source books/documents/authors
@@ -238,7 +232,10 @@ def _load_raw_pairs(raw_path):
     return pairs
 
 
-def generate_qa_dataset(source_dir, dest_dir, model_name):
+def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_threads=1):
+    if llm_client is None:
+        llm_client = LLMClient(provider="ollama")
+
     if not os.path.exists(source_dir):
         print(f"Source directory '{source_dir}' does not exist. Creating it now...")
         os.makedirs(source_dir, exist_ok=True)
@@ -268,6 +265,8 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
         
     if files_to_process:
         print(f"Processing {len(files_to_process)} Markdown files for Q&A generation...")
+        if num_threads > 1:
+            print(f"Using {num_threads} threads for parallel chunk processing.")
         
         failed_files = 0
         pbar = tqdm(files_to_process, desc="Generating Q&A", unit="file")
@@ -305,15 +304,41 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
                     start = split_point
                 
                 qa_pairs = []
-                for chunk_idx, chunk in enumerate(chunks):
-                    if not chunk:
-                        continue
-                    if len(chunks) > 1:
-                        pbar.set_postfix({"file": filename[:20], "chunk": f"{chunk_idx+1}/{len(chunks)}", "q_saved": total_saved})
-                    
-                    chunk_pairs = generate_qa_from_text(chunk, model_name=model_name, source_file=input_path)
-                    if isinstance(chunk_pairs, list):
-                        qa_pairs.extend(chunk_pairs)
+
+                if num_threads > 1 and len(chunks) > 1:
+                    # Parallel chunk processing
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    futures = {}
+                    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                        for chunk_idx, chunk in enumerate(chunks):
+                            if not chunk:
+                                continue
+                            future = executor.submit(
+                                generate_qa_from_text, chunk,
+                                model_name=model_name,
+                                source_file=input_path,
+                                llm_client=llm_client
+                            )
+                            futures[future] = chunk_idx
+
+                        completed = 0
+                        for future in as_completed(futures):
+                            completed += 1
+                            pbar.set_postfix({"file": filename[:20], "chunks": f"{completed}/{len(futures)}", "q_saved": total_saved})
+                            chunk_pairs = future.result()
+                            if isinstance(chunk_pairs, list):
+                                qa_pairs.extend(chunk_pairs)
+                else:
+                    # Sequential chunk processing (default)
+                    for chunk_idx, chunk in enumerate(chunks):
+                        if not chunk:
+                            continue
+                        if len(chunks) > 1:
+                            pbar.set_postfix({"file": filename[:20], "chunk": f"{chunk_idx+1}/{len(chunks)}", "q_saved": total_saved})
+                        
+                        chunk_pairs = generate_qa_from_text(chunk, model_name=model_name, source_file=input_path, llm_client=llm_client)
+                        if isinstance(chunk_pairs, list):
+                            qa_pairs.extend(chunk_pairs)
                                 
                 if isinstance(qa_pairs, list):
                     file_count = 0
@@ -361,7 +386,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
     
     if not all_qa_pairs:
         print("ERROR: No Q&A pairs were generated at all! Check error.log for details.")
-        print("Common causes: Ollama not running, model not available, or all AI responses were unparseable.")
+        print("Common causes: LLM server not running, model not available, or all AI responses were unparseable.")
         return
     
     # Phase 2: Filter out any remaining source references from raw data
@@ -399,5 +424,5 @@ def generate_qa_dataset(source_dir, dest_dir, model_name):
     print(f"Saved Markdown readable dataset to: {dataset_md_path}")
     print(f"Raw data preserved in: {raw_jsonl_path}")
 
-    # Unload model from VRAM now that processing is complete
-    _unload_model(model_name)
+    # Unload model from VRAM (only for Ollama)
+    llm_client.unload_model(model_name)

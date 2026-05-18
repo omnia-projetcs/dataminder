@@ -1,29 +1,23 @@
 import os
 import time
 import argparse
-import ollama
 from datetime import datetime
 from extractor import extract_text
 from summarizer import summarize_text
+from llm_client import LLMClient
 from tqdm import tqdm
 
 CHUNK_SIZE = 5000
-
-def _unload_model(model_name):
-    """Send a dummy request with keep_alive=0 to unload the model from VRAM."""
-    try:
-        ollama.chat(model=model_name, messages=[
-            {'role': 'user', 'content': '.'}
-        ], keep_alive=0)
-    except Exception:
-        pass
 
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] FILE: {filepath} | PIPELINE ERROR: {error_msg}\n")
 
-def process_documents(source_dir, dest_dir, model_name, level=7, force=False):
+def process_documents(source_dir, dest_dir, model_name, level=7, force=False, llm_client=None, num_threads=1):
+    if llm_client is None:
+        llm_client = LLMClient(provider="ollama")
+
     if not os.path.exists(source_dir):
         print(f"Source directory '{source_dir}' does not exist. Creating it now...")
         os.makedirs(source_dir, exist_ok=True)
@@ -63,6 +57,8 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False):
         return
     
     print(f"Processing {len(files_to_process)} documents...")
+    if num_threads > 1:
+        print(f"Using {num_threads} threads for parallel chunk processing.")
     
     pbar = tqdm(files_to_process, desc="Processing", unit="doc")
     for input_path in pbar:
@@ -110,9 +106,42 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False):
                 if len(chunks) <= 1:
                     pbar.set_postfix({"file": filename[:20], "step": f"AI Summarizing (L{level})"})
                     t0 = time.time()
-                    summary_md = summarize_text(text, model_name=model_name, level=level)
+                    summary_md = summarize_text(text, model_name=model_name, level=level, llm_client=llm_client)
                     elapsed = time.time() - t0
                     pbar.set_postfix({"file": filename[:20], "step": f"Done", "time": f"{elapsed:.1f}s"})
+                elif num_threads > 1:
+                    # Parallel chunk processing
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    summaries_by_idx = {}
+                    chunk_times = []
+                    
+                    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                        futures = {}
+                        for idx, chunk in enumerate(chunks):
+                            if not chunk.strip():
+                                continue
+                            future = executor.submit(
+                                _summarize_chunk_timed, chunk, model_name, level, llm_client
+                            )
+                            futures[future] = idx
+                        
+                        completed = 0
+                        for future in as_completed(futures):
+                            idx = futures[future]
+                            chunk_sum, elapsed = future.result()
+                            chunk_times.append(elapsed)
+                            completed += 1
+                            avg_so_far = f" | avg={sum(chunk_times)/len(chunk_times):.1f}s" if chunk_times else ""
+                            pbar.set_postfix({"file": filename[:20], "step": f"AI Sum {completed}/{len(futures)}{avg_so_far}"})
+                            if chunk_sum:
+                                summaries_by_idx[idx] = chunk_sum
+                    
+                    # Reassemble in original order
+                    summaries = [summaries_by_idx[i] for i in sorted(summaries_by_idx.keys())]
+                    summary_md = "\n\n".join(summaries)
+                    total_t = sum(chunk_times)
+                    avg_t = total_t / len(chunk_times) if chunk_times else 0
+                    pbar.set_postfix({"file": filename[:20], "step": f"Done", "avg": f"{avg_t:.1f}s/chunk"})
                 else:
                     summaries = []
                     chunk_times = []
@@ -122,7 +151,7 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False):
                         avg_so_far = f" | avg={sum(chunk_times)/len(chunk_times):.1f}s" if chunk_times else ""
                         pbar.set_postfix({"file": filename[:20], "step": f"AI Sum {idx+1}/{len(chunks)}{avg_so_far}"})
                         t0 = time.time()
-                        chunk_sum = summarize_text(chunk, model_name=model_name, level=level)
+                        chunk_sum = summarize_text(chunk, model_name=model_name, level=level, llm_client=llm_client)
                         elapsed = time.time() - t0
                         chunk_times.append(elapsed)
                         if chunk_sum:
@@ -142,30 +171,54 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False):
             log_error(input_path, f"Unexpected exception: {error_details}")
             continue
 
-    # Unload model from VRAM now that processing is complete
-    _unload_model(model_name)
+    # Unload model from VRAM now that processing is complete (Ollama only)
+    llm_client.unload_model(model_name)
+
+
+def _summarize_chunk_timed(chunk, model_name, level, llm_client):
+    """Wrapper that returns (summary, elapsed_time) for use in thread pool."""
+    t0 = time.time()
+    result = summarize_text(chunk, model_name=model_name, level=level, llm_client=llm_client)
+    elapsed = time.time() - t0
+    return result, elapsed
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
     parser.add_argument("--source", default="source", help="Source directory containing the documents to process (default: source).")
     parser.add_argument("--dest", default="destination", help="Destination directory for the Markdown summaries (default: destination).")
-    parser.add_argument("--model", default="gemma3:12b", help="Ollama model to use (default: gemma3:12b).")
+    parser.add_argument("--model", default="gemma3:12b", help="Model to use (default: gemma3:12b).")
     parser.add_argument("--level", type=int, default=9, help="Summarization detail level from 1 to 10. 0 means no summarization (saves raw text). Default: 9.")
     parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
     parser.add_argument("--force", action="store_true", help="Force reprocessing of all files, ignoring resume state.")
     
+    # vLLM / provider options
+    parser.add_argument("--provider", default="ollama", choices=["ollama", "vllm"], help="LLM provider to use: 'ollama' (local, default) or 'vllm' (remote OpenAI-compatible server).")
+    parser.add_argument("--vllm-url", default="http://localhost:8000", help="vLLM server URL (default: http://localhost:8000). Only used when --provider=vllm.")
+    parser.add_argument("--vllm-key", default="", help="API key for the vLLM server (optional). Only used when --provider=vllm.")
+    parser.add_argument("--threads", type=int, nargs='?', const=5, default=None, help="Enable multithreaded chunk processing. Without a value, defaults to 5 threads. You can specify a custom number (e.g. --threads 8). Omit this flag entirely for sequential processing.")
+    
     args = parser.parse_args()
+    
+    # Build the LLM client
+    llm_client = LLMClient(
+        provider=args.provider,
+        vllm_url=args.vllm_url,
+        vllm_api_key=args.vllm_key
+    )
+    num_threads = args.threads if args.threads else 1
+    print(f"LLM Client: {llm_client}" + (f" | Threads: {num_threads}" if num_threads > 1 else ""))
     
     if args.full:
         from qa_generator import generate_qa_dataset
         print("--- Starting FULL Pipeline ---")
         print("\n[Step 1/2] Document Processing")
-        process_documents(args.source, args.dest, args.model, args.level, force=args.force)
+        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads)
         
         print("\n[Step 2/2] Q&A Dataset Generation")
         qa_dest = "dataresults" if args.dest == "destination" else f"{args.dest}_qa"
-        generate_qa_dataset(args.dest, qa_dest, args.model)
+        generate_qa_dataset(args.dest, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads)
         print("\n--- Full Pipeline Complete ---")
     elif args.qa:
         from qa_generator import generate_qa_dataset
@@ -175,7 +228,7 @@ if __name__ == "__main__":
         qa_source = "destination" if args.source == "source" else args.source
         qa_dest = "dataresults" if args.dest == "destination" else args.dest
         
-        generate_qa_dataset(qa_source, qa_dest, args.model)
+        generate_qa_dataset(qa_source, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads)
     else:
         print("--- Starting document processing ---")
-        process_documents(args.source, args.dest, args.model, args.level, force=args.force)
+        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads)

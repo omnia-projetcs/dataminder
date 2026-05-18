@@ -125,3 +125,50 @@ You can change the AI model directly via the `--model` parameter when launching 
 ```bash
 python main.py --model mistral
 ```
+
+## Remote vLLM Support
+
+Dataminder supports using a remote **vLLM** server (or any OpenAI-compatible API) as an alternative to Ollama. This is useful when you want to leverage a powerful GPU server for inference.
+
+### Basic Usage
+
+```bash
+# Use a remote vLLM server
+python main.py --provider vllm --vllm-url http://my-server:8000 --model my-model-name
+
+# With an API key
+python main.py --provider vllm --vllm-url http://my-server:8000 --vllm-key sk-mykey --model my-model-name
+```
+
+### Multithreading (Parallel Chunk Processing)
+
+When using a remote vLLM server that can handle concurrent requests, you can speed up processing by using multiple threads. Each chunk of a document will be sent in parallel:
+
+```bash
+# Process chunks with 4 threads
+python main.py --provider vllm --vllm-url http://my-server:8000 --model my-model --threads 4
+
+# Full pipeline with 8 threads
+python main.py --full --provider vllm --vllm-url http://my-server:8000 --model my-model --threads 8
+
+# QA generation with multithreading
+python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-model --threads 4
+```
+
+> **Note:** Multithreading is mainly beneficial with remote servers that handle concurrent requests. When using Ollama locally, requests are serialized by the server, so `--threads > 1` won't improve speed.
+
+### All CLI Options
+
+| Argument | Default | Description |
+|---|---|---|
+| `--source` | `source` | Source directory for documents |
+| `--dest` | `destination` | Destination directory for summaries |
+| `--model` | `gemma3:12b` | Model name to use |
+| `--level` | `9` | Summarization detail (0-10, 0 = raw text) |
+| `--provider` | `ollama` | LLM provider: `ollama` or `vllm` |
+| `--vllm-url` | `http://localhost:8000` | vLLM server URL |
+| `--vllm-key` | *(empty)* | API key for vLLM (optional) |
+| `--threads` | *(off)* | Enable parallel chunk processing (default: 5 threads if activated, e.g. `--threads` or `--threads 8`) |
+| `--qa` | *(flag)* | Enable QA dataset generation mode |
+| `--full` | *(flag)* | Run full pipeline (summarize + QA) |
+| `--force` | *(flag)* | Force reprocessing of all files |
