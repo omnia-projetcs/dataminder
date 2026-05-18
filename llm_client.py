@@ -6,6 +6,7 @@ Supports two providers:
   - vllm   : Remote vLLM server via OpenAI-compatible API
 """
 
+import threading
 import ollama
 import requests
 
@@ -17,7 +18,9 @@ class LLMClient:
         self.provider = provider.lower()
         self.vllm_url = vllm_url.rstrip("/")
         self.vllm_api_key = vllm_api_key
-        self._vllm_endpoint = None  # auto-detected on first call: "chat" or "completions"
+        self._vllm_endpoint = None  # "chat" or "completions"
+        self._vllm_model = None     # auto-detected from /v1/models
+        self._detect_lock = threading.Lock()
 
         if self.provider not in ("ollama", "vllm"):
             raise ValueError(f"Unknown provider '{self.provider}'. Use 'ollama' or 'vllm'.")
@@ -62,42 +65,64 @@ class LLMClient:
         if self.vllm_api_key:
             headers["Authorization"] = f"Bearer {self.vllm_api_key}"
 
-        # Auto-detect the working endpoint on first call
+        # Ensure endpoint + model detection is done once, thread-safe
         if self._vllm_endpoint is None:
-            self._vllm_endpoint = self._detect_vllm_endpoint(headers)
-            print(f"[vLLM] Using endpoint: {self._vllm_endpoint}")
+            with self._detect_lock:
+                # Double-check after acquiring lock
+                if self._vllm_endpoint is None:
+                    self._detect_model(headers)
+                    self._detect_endpoint(self._vllm_model or model, messages, headers)
 
-        if self._vllm_endpoint == "chat":
-            return self._vllm_chat_completions(model, messages, headers)
+        # Use auto-detected model if available
+        resolved_model = self._vllm_model or model
+
+        # Use the detected endpoint
+        if self._vllm_endpoint == "completions":
+            return self._call_completions(resolved_model, messages, headers)
         else:
-            return self._vllm_completions(model, messages, headers)
+            return self._call_chat(resolved_model, messages, headers)
 
-    def _detect_vllm_endpoint(self, headers):
-        """Probe the server to find which endpoint is available."""
-        # Try /v1/chat/completions first
+    def _detect_model(self, headers):
+        """Query /v1/models to auto-detect the loaded model on the vLLM server."""
+        url = f"{self.vllm_url}/v1/models"
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = data.get("data", [])
+                if models:
+                    self._vllm_model = models[0].get("id", None)
+                    print(f"[vLLM] Auto-detected model: {self._vllm_model}")
+                else:
+                    print("[vLLM] /v1/models returned empty list, using --model value.")
+            else:
+                print(f"[vLLM] /v1/models returned {resp.status_code}, using --model value.")
+        except Exception as e:
+            print(f"[vLLM] Could not query /v1/models ({e}), using --model value.")
+
+    def _detect_endpoint(self, model, messages, headers):
+        """Detect which endpoint the vLLM server supports using a real request."""
+        # Try /v1/chat/completions with the actual request
         chat_url = f"{self.vllm_url}/v1/chat/completions"
-        try:
-            # Send a minimal probe request — we check for 404 specifically
-            probe = requests.post(chat_url, json={"model": "probe", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}, headers=headers, timeout=10)
-            if probe.status_code != 404:
-                return "chat"
-        except requests.exceptions.ConnectionError:
-            pass
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 8192,
+            "temperature": 0.7,
+        }
 
-        # Try /v1/completions
-        comp_url = f"{self.vllm_url}/v1/completions"
-        try:
-            probe = requests.post(comp_url, json={"model": "probe", "prompt": "hi", "max_tokens": 1}, headers=headers, timeout=10)
-            if probe.status_code != 404:
-                return "completions"
-        except requests.exceptions.ConnectionError:
-            pass
+        resp = requests.post(chat_url, json=payload, headers=headers, timeout=300)
 
-        # Default to chat and let it fail with a clear error
-        print("[vLLM] WARNING: Could not detect a working endpoint. Defaulting to /v1/chat/completions.")
-        return "chat"
+        if resp.status_code == 404:
+            # Chat endpoint doesn't exist, use completions
+            print(f"[vLLM] /v1/chat/completions not found (404), switching to /v1/completions")
+            self._vllm_endpoint = "completions"
+        else:
+            # Chat endpoint exists (even if the response is an error for another reason)
+            self._vllm_endpoint = "chat"
+            print(f"[vLLM] Using endpoint: /v1/chat/completions")
 
-    def _vllm_chat_completions(self, model, messages, headers):
+    def _call_chat(self, model, messages, headers):
         """Call the OpenAI-compatible /v1/chat/completions endpoint."""
         url = f"{self.vllm_url}/v1/chat/completions"
         payload = {
@@ -111,7 +136,7 @@ class LLMClient:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
-    def _vllm_completions(self, model, messages, headers):
+    def _call_completions(self, model, messages, headers):
         """Call the /v1/completions endpoint, formatting chat messages into a single prompt."""
         url = f"{self.vllm_url}/v1/completions"
         prompt = self._messages_to_prompt(messages)
@@ -146,4 +171,5 @@ class LLMClient:
         if self.provider == "ollama":
             return "LLMClient(provider=ollama)"
         endpoint = self._vllm_endpoint or "auto"
-        return f"LLMClient(provider=vllm, url={self.vllm_url}, endpoint={endpoint})"
+        model = self._vllm_model or "auto"
+        return f"LLMClient(provider=vllm, url={self.vllm_url}, endpoint={endpoint}, model={model})"
