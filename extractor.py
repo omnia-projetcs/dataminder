@@ -1,8 +1,5 @@
 import os
 import fitz  # PyMuPDF
-from pdf2image import convert_from_path
-import pytesseract
-from docx import Document
 import zipfile
 import rarfile
 from PIL import Image
@@ -10,11 +7,36 @@ import subprocess
 from pptx import Presentation
 import pandas as pd
 import tempfile
-import shutil
 from bs4 import BeautifulSoup
 import datetime
 import ebooklib
 from ebooklib import epub
+
+from ocr_engines import ocr_image, ocr_pdf, structured_parse, is_paddleocr_available
+
+# Module-level OCR configuration (set by main.py based on CLI args)
+_ocr_engine = "paddleocr"
+_ocr_device = "cpu"
+_ocr_lang = "en"
+
+
+def configure_ocr(engine="paddleocr", device="cpu", lang="en"):
+    """
+    Configure the OCR engine for all extraction calls.
+
+    Args:
+        engine: "paddleocr" (default, deep learning) or "tesseract" (legacy).
+        device: "cpu" or "gpu" (PaddleOCR only).
+        lang: Language hint (e.g., "en", "fr", "ch").
+    """
+    global _ocr_engine, _ocr_device, _ocr_lang
+    _ocr_engine = engine
+    _ocr_device = device
+    _ocr_lang = lang
+
+    engine_name = "PaddleOCR PP-OCRv5" if engine == "paddleocr" else "Tesseract"
+    print(f"[OCR] Configured: engine={engine_name}, device={device}, lang={lang}")
+
 
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
@@ -26,10 +48,30 @@ def extract_text_from_txt(path):
         return f.read()
 
 def extract_text_from_docx(path):
+    from docx import Document
     doc = Document(path)
     return "\n".join([para.text for para in doc.paragraphs])
 
-def extract_text_from_pdf(path):
+def extract_text_from_pdf(path, structured=False):
+    """
+    Extract text from a PDF file.
+
+    Strategy:
+      1. Try direct text extraction with PyMuPDF (for native/digital PDFs)
+      2. If text is sparse (scanned PDF), fall back to OCR
+      3. If structured=True, use PP-StructureV3 for layout-aware extraction
+
+    Args:
+        path: Path to the PDF file.
+        structured: If True, use PP-StructureV3 for structured Markdown output.
+    """
+    # Structured mode: use PP-StructureV3 if available
+    if structured:
+        result = structured_parse(path, device=_ocr_device)
+        if result:
+            return result
+        print(f"[{path}] PP-StructureV3 unavailable or failed. Falling back to standard extraction.")
+
     text = ""
     # Try normal PDF extraction first
     try:
@@ -48,19 +90,32 @@ def extract_text_from_pdf(path):
     return text
 
 def extract_text_from_pdf_ocr(path):
+    """
+    OCR a scanned PDF using the configured OCR engine.
+
+    With PaddleOCR (default):
+      - Processes PDF directly (no intermediate image conversion needed)
+      - Deep learning text detection + recognition (PP-OCRv5)
+      - Automatic orientation correction
+      - Automatic distortion/warping correction
+
+    With Tesseract (legacy fallback):
+      - Converts pages to images via pdf2image/poppler
+      - Traditional LSTM-based OCR
+    """
     try:
-        # Requires poppler-utils installed on the system
-        images = convert_from_path(path)
-        text = ""
-        # Requires tesseract-ocr installed on the system
-        for img in images:
-            text += pytesseract.image_to_string(img, lang='fra+eng') + "\n"
-        return text
+        return ocr_pdf(path, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang)
     except Exception as e:
-        log_error(path, f"Failed to extract text via OCR. Ensure tesseract-ocr and poppler-utils are installed. Error: {e}")
+        log_error(path, f"Failed to extract text via OCR ({_ocr_engine}). Error: {e}")
         return ""
 
 def extract_text_from_cbz_cbr(path):
+    """
+    Extract text from comic book archives (CBZ/CBR) using OCR.
+
+    With PaddleOCR: deep learning detection handles speech bubbles,
+    captions, and onomatopoeia much better than Tesseract.
+    """
     ext = os.path.splitext(path)[1].lower()
     text = ""
     try:
@@ -71,7 +126,7 @@ def extract_text_from_cbz_cbr(path):
                 for img_name in image_files:
                     with archive.open(img_name) as file:
                         img = Image.open(file)
-                        text += pytesseract.image_to_string(img, lang='fra+eng') + "\n"
+                        text += ocr_image(img, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang) + "\n"
         elif ext == '.cbr':
             with rarfile.RarFile(path, 'r') as archive:
                 image_files = [f for f in archive.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
@@ -79,7 +134,7 @@ def extract_text_from_cbz_cbr(path):
                 for img_name in image_files:
                     with archive.open(img_name) as file:
                         img = Image.open(file)
-                        text += pytesseract.image_to_string(img, lang='fra+eng') + "\n"
+                        text += ocr_image(img, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang) + "\n"
         return text
     except Exception as e:
         log_error(path, f"Error reading archive (CBZ/CBR): {e}. Make sure 'unrar' is installed.")
@@ -167,7 +222,28 @@ def extract_text_from_epub(path):
         log_error(path, f"Error reading EPUB: {e}")
         return ""
 
-def extract_text(path):
+def extract_text_from_image(path):
+    """
+    Extract text from a standalone image file using OCR.
+
+    Supports: PNG, JPG, JPEG, WEBP, BMP, TIFF.
+    """
+    try:
+        img = Image.open(path)
+        return ocr_image(img, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang)
+    except Exception as e:
+        log_error(path, f"Error reading image for OCR: {e}")
+        return ""
+
+def extract_text(path, structured=False):
+    """
+    Extract text from a document file.
+
+    Args:
+        path: Path to the document file.
+        structured: If True and the file is a PDF, use PP-StructureV3
+                    for layout-aware structured Markdown output.
+    """
     ext = os.path.splitext(path)[1].lower()
     
     if ext in ['.txt', '.md', '.rst']:
@@ -175,7 +251,7 @@ def extract_text(path):
     elif ext == '.docx':
         return extract_text_from_docx(path)
     elif ext == '.pdf':
-        return extract_text_from_pdf(path)
+        return extract_text_from_pdf(path, structured=structured)
     elif ext in ['.cbz', '.cbr']:
         return extract_text_from_cbz_cbr(path)
     elif ext == '.pptx':
@@ -190,6 +266,8 @@ def extract_text(path):
         return extract_text_from_chm(path)
     elif ext == '.epub':
         return extract_text_from_epub(path)
+    elif ext in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif']:
+        return extract_text_from_image(path)
     else:
         log_error(path, f"Unsupported file extension: {ext}")
         return ""

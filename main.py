@@ -2,7 +2,7 @@ import os
 import time
 import argparse
 from datetime import datetime
-from extractor import extract_text
+from extractor import extract_text, configure_ocr
 from summarizer import summarize_text
 from llm_client import LLMClient
 from tqdm import tqdm
@@ -14,7 +14,7 @@ def log_error(filepath, error_msg):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] FILE: {filepath} | PIPELINE ERROR: {error_msg}\n")
 
-def process_documents(source_dir, dest_dir, model_name, level=7, force=False, llm_client=None, num_threads=1):
+def process_documents(source_dir, dest_dir, model_name, level=7, force=False, llm_client=None, num_threads=1, structured=False):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
 
@@ -29,11 +29,11 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
     for root, _, files in os.walk(source_dir):
         for file in files:
             ext = os.path.splitext(file)[1].lower()
-            if ext in ['.txt', '.md', '.rst', '.docx', '.pdf', '.cbz', '.cbr', '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm', '.epub']:
+            if ext in ['.txt', '.md', '.rst', '.docx', '.pdf', '.cbz', '.cbr', '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm', '.epub', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif']:
                 files_to_process.append(os.path.join(root, file))
     
     if not files_to_process:
-        print(f"No supported documents (txt, md, rst, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm, epub) found in '{source_dir}'.")
+        print(f"No supported documents (txt, md, rst, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm, epub, png, jpg, webp, bmp, tiff) found in '{source_dir}'.")
         return
         
     # Resume: filter out already processed files unless --force
@@ -72,7 +72,7 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
         try:
                 
             pbar.set_postfix({"file": filename[:20], "step": "Extracting text"})
-            text = extract_text(input_path)
+            text = extract_text(input_path, structured=structured)
             
             if not text.strip():
                 tqdm.write(f"\n[{filename}] No text could be extracted. Skipping.")
@@ -199,6 +199,12 @@ if __name__ == "__main__":
     parser.add_argument("--vllm-key", default="", help="API key for the vLLM server (optional). Only used when --provider=vllm.")
     parser.add_argument("--threads", type=int, nargs='?', const=5, default=None, help="Enable multithreaded chunk processing. Without a value, defaults to 5 threads. You can specify a custom number (e.g. --threads 8). Omit this flag entirely for sequential processing.")
     
+    # OCR engine options (PaddleOCR integration)
+    parser.add_argument("--ocr-engine", default="paddleocr", choices=["paddleocr", "tesseract"], help="OCR engine to use: 'paddleocr' (PP-OCRv5, deep learning, default) or 'tesseract' (legacy). PaddleOCR is significantly more accurate.")
+    parser.add_argument("--ocr-device", default="cpu", choices=["cpu", "gpu"], help="Device for OCR inference: 'cpu' (default) or 'gpu'. Only affects PaddleOCR.")
+    parser.add_argument("--ocr-lang", default="en", help="Language hint for OCR engine (default: en). PaddleOCR supports 109 languages natively. Examples: en, fr, ch, de, es, ja, ko, ar.")
+    parser.add_argument("--structured", action="store_true", help="Use PP-StructureV3 for layout-aware PDF parsing (extracts tables, formulas, headings as structured Markdown). Requires PaddleOCR with structure support.")
+    
     args = parser.parse_args()
     
     # Build the LLM client
@@ -208,13 +214,17 @@ if __name__ == "__main__":
         vllm_api_key=args.vllm_key
     )
     num_threads = args.threads if args.threads else 1
+    
+    # Configure OCR engine
+    configure_ocr(engine=args.ocr_engine, device=args.ocr_device, lang=args.ocr_lang)
+    
     print(f"LLM Client: {llm_client}" + (f" | Threads: {num_threads}" if num_threads > 1 else ""))
     
     if args.full:
         from qa_generator import generate_qa_dataset
         print("--- Starting FULL Pipeline ---")
         print("\n[Step 1/2] Document Processing")
-        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads)
+        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads, structured=args.structured)
         
         print("\n[Step 2/2] Q&A Dataset Generation")
         qa_dest = "dataresults" if args.dest == "destination" else f"{args.dest}_qa"
@@ -231,4 +241,4 @@ if __name__ == "__main__":
         generate_qa_dataset(qa_source, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads)
     else:
         print("--- Starting document processing ---")
-        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads)
+        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads, structured=args.structured)

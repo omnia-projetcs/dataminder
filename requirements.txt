@@ -12,3 +12,4 @@ openpyxl
 xlrd
 beautifulsoup4
 EbookLib
+paddleocr

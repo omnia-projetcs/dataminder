@@ -2,20 +2,23 @@
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
 ![Ollama](https://img.shields.io/badge/AI-Ollama-black?logo=ollama&logoColor=white)
-![Tesseract OCR](https://img.shields.io/badge/OCR-Tesseract-green)
+![PaddleOCR](https://img.shields.io/badge/OCR-PaddleOCR%20PP--OCRv5-blue?logo=paddle&logoColor=white)
+![Tesseract OCR](https://img.shields.io/badge/OCR-Tesseract%20(fallback)-green)
 ![Pandas](https://img.shields.io/badge/Data-Pandas-150458?logo=pandas&logoColor=white)
 ![BeautifulSoup](https://img.shields.io/badge/Web-BeautifulSoup-red)
 
-**Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, HTML) including scanned images via Tesseract OCR. Using local Large Language Models (LLMs) via **Ollama**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
+**Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, Images, HTML) using deep-learning OCR powered by **PaddleOCR PP-OCRv5** (with Tesseract as legacy fallback). Using local Large Language Models (LLMs) via **Ollama** or **vLLM**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
 
 ## Why Dataminder?
 - **100% Offline & Private:** No API keys, no cloud data leaks. Everything runs locally on your machine.
 - **Automated ML Dataset Creation:** Seamlessly converts unstructured local documents into deduplicated Alpaca JSON datasets for AI training.
-- **Smart OCR Fallback:** Automatically detects scanned PDFs/images and switches to Tesseract OCR.
+- **Deep Learning OCR:** Powered by PaddleOCR PP-OCRv5 — 13% more accurate than previous generation, 109 languages, auto orientation/distortion correction.
+- **Structured Document Parsing:** Optional PP-StructureV3 mode extracts tables, formulas, and layout as structured Markdown.
+- **Smart OCR Fallback:** Automatically detects scanned PDFs/images and applies OCR. Falls back to Tesseract if PaddleOCR is unavailable.
 - **Fail-Safe Pipeline:** Continuous processing with automatic skipped files and comprehensive `error.log` generation.
 
 ## Supported Formats
-`.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.epub`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`
+`.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.epub`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`, `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tiff`
 
 ## Prerequisites
 
@@ -41,6 +44,15 @@ chmod +x install.sh
 ```
 
 > **Note:** The installation script uses `sudo` to install `tesseract-ocr` and `poppler-utils`. It will prompt you for your password.
+
+### PaddleOCR Installation (Recommended)
+
+PaddleOCR is included in the Python dependencies (`requirements.txt`). It will be installed automatically with `pip install -r requirements.txt`.
+
+For GPU acceleration (CUDA), install the GPU variant of PaddlePaddle:
+```bash
+pip install paddlepaddle-gpu
+```
 
 ## Usage
 
@@ -73,6 +85,18 @@ Here are the most common commands you will need:
 - **Adjust Summarization Level:** Control the summary length from 1 (brief) to 10 (exhaustive). 0 saves the raw text without AI processing:
   ```bash
   python main.py --level 3
+  ```
+- **Use GPU for OCR:** Accelerate OCR processing with CUDA:
+  ```bash
+  python main.py --ocr-device gpu
+  ```
+- **Structured PDF parsing:** Extract tables, formulas, and layout from PDFs:
+  ```bash
+  python main.py --structured
+  ```
+- **Use Tesseract instead of PaddleOCR:**
+  ```bash
+  python main.py --ocr-engine tesseract
   ```
 
 ### Detailed Commands
@@ -169,6 +193,36 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 | `--vllm-url` | `http://localhost:8000` | vLLM server URL |
 | `--vllm-key` | *(empty)* | API key for vLLM (optional) |
 | `--threads` | *(off)* | Enable parallel chunk processing (default: 5 threads if activated, e.g. `--threads` or `--threads 8`) |
+| `--ocr-engine` | `paddleocr` | OCR engine: `paddleocr` (PP-OCRv5, deep learning) or `tesseract` (legacy) |
+| `--ocr-device` | `cpu` | Device for OCR inference: `cpu` or `gpu` (PaddleOCR only) |
+| `--ocr-lang` | `en` | Language hint for OCR (e.g., `en`, `fr`, `ch`, `de`, `ja`, `ko`) |
+| `--structured` | *(flag)* | Use PP-StructureV3 for layout-aware PDF parsing |
 | `--qa` | *(flag)* | Enable QA dataset generation mode |
 | `--full` | *(flag)* | Run full pipeline (summarize + QA) |
 | `--force` | *(flag)* | Force reprocessing of all files |
+
+## OCR Engine Details
+
+### PaddleOCR PP-OCRv5 (Default)
+
+PaddleOCR is the default OCR engine. It uses deep learning models from [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) for significantly better accuracy than Tesseract:
+
+- **PP-OCRv5 text detection** — Deep learning based text zone detection
+- **PP-OCRv5 text recognition** — 13% more accurate than PP-OCRv4, 109 languages natively
+- **Auto orientation correction** — Detects and corrects rotated documents
+- **Auto distortion correction** — Fixes warped/photographed documents
+- **Direct PDF processing** — No intermediate image conversion needed
+- **GPU acceleration** — Use `--ocr-device gpu` for faster processing
+
+### PP-StructureV3 (Structured Parsing)
+
+When `--structured` is enabled, Dataminder uses PP-StructureV3 for layout-aware document parsing:
+
+- Extracts headings, paragraphs, tables, images, and formulas
+- Converts tables to Markdown tables
+- Converts formulas to LaTeX
+- Much better output quality for complex documents with mixed content
+
+### Tesseract (Legacy Fallback)
+
+Tesseract is kept as a fallback engine (`--ocr-engine tesseract`). PaddleOCR automatically falls back to Tesseract if the `paddleocr` package is not installed.
