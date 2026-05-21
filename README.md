@@ -7,7 +7,7 @@
 ![Pandas](https://img.shields.io/badge/Data-Pandas-150458?logo=pandas&logoColor=white)
 ![BeautifulSoup](https://img.shields.io/badge/Web-BeautifulSoup-red)
 
-**Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, Images, HTML) using deep-learning OCR powered by **PaddleOCR PP-OCRv5** (with Tesseract as legacy fallback). Using local Large Language Models (LLMs) via **Ollama** or **vLLM**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
+**Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, Images, Audio, Video, HTML) using deep-learning OCR powered by **PaddleOCR PP-OCRv5** (with Tesseract as legacy fallback) and speech-to-text transcription via **faster-whisper** (Whisper). Using local Large Language Models (LLMs) via **Ollama** or **vLLM**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
 
 ## Why Dataminder?
 - **100% Offline & Private:** No API keys, no cloud data leaks. Everything runs locally on your machine.
@@ -18,7 +18,14 @@
 - **Fail-Safe Pipeline:** Continuous processing with automatic skipped files and comprehensive `error.log` generation.
 
 ## Supported Formats
-`.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.epub`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`, `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tiff`
+
+**Documents:** `.txt`, `.md`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, `.pdf`, `.epub`, `.cbz`, `.cbr`, `.html`, `.htm`, `.chm`
+
+**Images (OCR):** `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tiff`
+
+**Audio (Transcription):** `.mp3`, `.wav`, `.ogg`, `.flac`, `.m4a`, `.wma`, `.aac`
+
+**Video (Transcription):** `.mp4`, `.mkv`, `.avi`, `.mov`, `.webm`, `.flv`, `.wmv`
 
 ## Prerequisites
 
@@ -97,6 +104,22 @@ Here are the most common commands you will need:
 - **Use Tesseract instead of PaddleOCR:**
   ```bash
   python main.py --ocr-engine tesseract
+  ```
+- **Transcribe audio files:** Process audio files (mp3, wav, ogg, flac...) from `./source`:
+  ```bash
+  python main.py --source ./podcasts
+  ```
+- **Transcribe videos:** Process video files (mp4, mkv, avi...) with a specific Whisper model:
+  ```bash
+  python main.py --source ./videos --whisper-model small
+  ```
+- **Transcribe in a specific language:**
+  ```bash
+  python main.py --source ./audio_fr --whisper-lang fr
+  ```
+- **GPU-accelerated transcription:**
+  ```bash
+  python main.py --source ./podcasts --whisper-device cuda --whisper-model medium
   ```
 
 ### Detailed Commands
@@ -197,6 +220,9 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 | `--ocr-device` | `cpu` | Device for OCR inference: `cpu` or `gpu` (PaddleOCR only) |
 | `--ocr-lang` | `en` | Language hint for OCR (e.g., `en`, `fr`, `ch`, `de`, `ja`, `ko`) |
 | `--structured` | *(flag)* | Use PP-StructureV3 for layout-aware PDF parsing |
+| `--whisper-model` | `base` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `--whisper-device` | `cpu` | Device for Whisper inference: `cpu` or `cuda` |
+| `--whisper-lang` | *(auto)* | Source language for transcription (e.g., `en`, `fr`). Default: auto-detect |
 | `--qa` | *(flag)* | Enable QA dataset generation mode |
 | `--full` | *(flag)* | Run full pipeline (summarize + QA) |
 | `--force` | *(flag)* | Force reprocessing of all files |
@@ -226,3 +252,29 @@ When `--structured` is enabled, Dataminder uses PP-StructureV3 for layout-aware 
 ### Tesseract (Legacy Fallback)
 
 Tesseract is kept as a fallback engine (`--ocr-engine tesseract`). PaddleOCR automatically falls back to Tesseract if the `paddleocr` package is not installed.
+
+## Audio & Video Transcription (faster-whisper)
+
+Dataminder uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for speech-to-text transcription. It is a CTranslate2-based reimplementation of OpenAI's Whisper, offering ~4x faster inference with ~3x less memory while maintaining identical accuracy.
+
+### How It Works
+
+1. **Audio files** (mp3, wav, ogg, flac, m4a, wma, aac) are transcribed directly
+2. **Video files** (mp4, mkv, avi, mov, webm, flv, wmv) have their audio track extracted via `ffmpeg`, then transcribed
+3. The transcribed text is then processed through the same summarization pipeline as any other document
+
+### Model Selection
+
+| Model | Size | Speed | Accuracy | Best For |
+|---|---|---|---|---|
+| `tiny` | ~40 MB | ⚡⚡⚡⚡ | ★★ | Quick previews, low resources |
+| `base` | ~140 MB | ⚡⚡⚡ | ★★★ | **Default — good balance** |
+| `small` | ~460 MB | ⚡⚡ | ★★★★ | Better accuracy, still fast |
+| `medium` | ~1.5 GB | ⚡ | ★★★★★ | High accuracy |
+| `large-v3` | ~3 GB | 🐢 | ★★★★★★ | Maximum accuracy |
+
+### Requirements
+
+- **ffmpeg**: Required for video transcription (audio extraction). Install with `sudo apt-get install ffmpeg` or `brew install ffmpeg`.
+- **faster-whisper**: Included in `requirements.txt`. Installed automatically.
+- **GPU (optional)**: Use `--whisper-device cuda` for GPU-accelerated transcription. Requires CUDA-compatible GPU.

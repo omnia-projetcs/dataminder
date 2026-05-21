@@ -13,11 +13,20 @@ import ebooklib
 from ebooklib import epub
 
 from ocr_engines import ocr_image, ocr_pdf, structured_parse, is_paddleocr_available
+from transcriber import (
+    transcribe_audio, transcribe_video,
+    AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
+)
 
 # Module-level OCR configuration (set by main.py based on CLI args)
 _ocr_engine = "paddleocr"
 _ocr_device = "cpu"
 _ocr_lang = "en"
+
+# Module-level Whisper configuration (set by main.py based on CLI args)
+_whisper_model = "base"
+_whisper_device = "cpu"
+_whisper_lang = None
 
 
 def configure_ocr(engine="paddleocr", device="cpu", lang="en"):
@@ -36,6 +45,23 @@ def configure_ocr(engine="paddleocr", device="cpu", lang="en"):
 
     engine_name = "PaddleOCR PP-OCRv5" if engine == "paddleocr" else "Tesseract"
     print(f"[OCR] Configured: engine={engine_name}, device={device}, lang={lang}")
+
+
+def configure_whisper(model="base", device="cpu", lang=None):
+    """
+    Configure the Whisper transcription engine.
+
+    Args:
+        model: Whisper model size (tiny, base, small, medium, large-v3).
+        device: "cpu" or "cuda".
+        lang: Language code (e.g., "en", "fr"). None for auto-detection.
+    """
+    global _whisper_model, _whisper_device, _whisper_lang
+    _whisper_model = model
+    _whisper_device = device
+    _whisper_lang = lang
+    lang_display = lang if lang else "auto-detect"
+    print(f"[Whisper] Configured: model={model}, device={device}, lang={lang_display}")
 
 
 def log_error(filepath, error_msg):
@@ -235,6 +261,41 @@ def extract_text_from_image(path):
         log_error(path, f"Error reading image for OCR: {e}")
         return ""
 
+def extract_text_from_audio(path):
+    """
+    Transcribe an audio file to text using faster-whisper.
+
+    Supports: MP3, WAV, OGG, FLAC, M4A, WMA, AAC.
+    """
+    try:
+        return transcribe_audio(
+            path,
+            model_size=_whisper_model,
+            device=_whisper_device,
+            language=_whisper_lang
+        )
+    except Exception as e:
+        log_error(path, f"Error transcribing audio: {e}")
+        return ""
+
+def extract_text_from_video(path):
+    """
+    Transcribe a video file by extracting its audio track first.
+
+    Supports: MP4, MKV, AVI, MOV, WEBM, FLV, WMV.
+    Requires ffmpeg installed on the system.
+    """
+    try:
+        return transcribe_video(
+            path,
+            model_size=_whisper_model,
+            device=_whisper_device,
+            language=_whisper_lang
+        )
+    except Exception as e:
+        log_error(path, f"Error transcribing video: {e}")
+        return ""
+
 def extract_text(path, structured=False):
     """
     Extract text from a document file.
@@ -268,6 +329,10 @@ def extract_text(path, structured=False):
         return extract_text_from_epub(path)
     elif ext in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif']:
         return extract_text_from_image(path)
+    elif ext in AUDIO_EXTENSIONS:
+        return extract_text_from_audio(path)
+    elif ext in VIDEO_EXTENSIONS:
+        return extract_text_from_video(path)
     else:
         log_error(path, f"Unsupported file extension: {ext}")
         return ""

@@ -2,7 +2,8 @@ import os
 import time
 import argparse
 from datetime import datetime
-from extractor import extract_text, configure_ocr
+from extractor import extract_text, configure_ocr, configure_whisper
+from transcriber import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 from summarizer import summarize_text
 from llm_client import LLMClient
 from tqdm import tqdm
@@ -29,11 +30,17 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
     for root, _, files in os.walk(source_dir):
         for file in files:
             ext = os.path.splitext(file)[1].lower()
-            if ext in ['.txt', '.md', '.rst', '.docx', '.pdf', '.cbz', '.cbr', '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm', '.epub', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif']:
+            supported_exts = {
+                '.txt', '.md', '.rst', '.docx', '.pdf', '.cbz', '.cbr',
+                '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm',
+                '.epub', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'
+            } | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+            if ext in supported_exts:
                 files_to_process.append(os.path.join(root, file))
     
     if not files_to_process:
-        print(f"No supported documents (txt, md, rst, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm, epub, png, jpg, webp, bmp, tiff) found in '{source_dir}'.")
+        print(f"No supported documents found in '{source_dir}'.")
+        print("Supported: txt, md, rst, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm, epub, png, jpg, webp, bmp, tiff, mp3, wav, ogg, flac, m4a, mp4, mkv, avi, mov, webm")
         return
         
     # Resume: filter out already processed files unless --force
@@ -205,6 +212,11 @@ if __name__ == "__main__":
     parser.add_argument("--ocr-lang", default="en", help="Language hint for OCR engine (default: en). PaddleOCR supports 109 languages natively. Examples: en, fr, ch, de, es, ja, ko, ar.")
     parser.add_argument("--structured", action="store_true", help="Use PP-StructureV3 for layout-aware PDF parsing (extracts tables, formulas, headings as structured Markdown). Requires PaddleOCR with structure support.")
     
+    # Whisper transcription options (audio/video)
+    parser.add_argument("--whisper-model", default="base", choices=["tiny", "base", "small", "medium", "large-v3"], help="Whisper model size for audio/video transcription (default: base). Larger models are more accurate but slower.")
+    parser.add_argument("--whisper-device", default="cpu", choices=["cpu", "cuda"], help="Device for Whisper inference: 'cpu' (default) or 'cuda' (GPU).")
+    parser.add_argument("--whisper-lang", default=None, help="Source language for transcription (e.g., 'en', 'fr'). Default: auto-detect.")
+    
     args = parser.parse_args()
     
     # Build the LLM client
@@ -217,6 +229,9 @@ if __name__ == "__main__":
     
     # Configure OCR engine
     configure_ocr(engine=args.ocr_engine, device=args.ocr_device, lang=args.ocr_lang)
+    
+    # Configure Whisper transcription engine
+    configure_whisper(model=args.whisper_model, device=args.whisper_device, lang=args.whisper_lang)
     
     print(f"LLM Client: {llm_client}" + (f" | Threads: {num_threads}" if num_threads > 1 else ""))
     
