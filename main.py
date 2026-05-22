@@ -1,4 +1,7 @@
 import os
+# Disable oneDNN (MKLDNN) to prevent NotImplementedError in PaddlePaddle 3.3.0+ CPU inference
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+
 import time
 import argparse
 from datetime import datetime

@@ -15,6 +15,9 @@ PaddleOCR features integrated from https://github.com/PaddlePaddle/PaddleOCR:
 """
 
 import os
+# Disable oneDNN (MKLDNN) to prevent NotImplementedError in PaddlePaddle 3.3.0+ CPU inference
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+
 import datetime
 from PIL import Image
 
@@ -88,6 +91,7 @@ def _get_paddleocr(device="cpu", lang="en"):
             use_doc_unwarping=True,             # Auto-correct distortion/warping
             use_textline_orientation=True,       # Correct text line direction
             device=device,
+            enable_mkldnn=False,
         )
         print(f"[PaddleOCR] Initialized PP-OCRv5 engine (device={device}, lang={lang})")
     return _paddleocr_instance
