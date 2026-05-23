@@ -17,6 +17,7 @@ PaddleOCR features integrated from https://github.com/PaddlePaddle/PaddleOCR:
 import os
 # Disable oneDNN (MKLDNN) to prevent NotImplementedError in PaddlePaddle 3.3.0+ CPU inference
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "0"
 
 import datetime
 from PIL import Image
@@ -271,7 +272,7 @@ def ocr_image(image, engine="paddleocr", device="cpu", lang="en"):
     """
     Unified OCR interface: run OCR on a PIL Image.
 
-    Tries the requested engine, falls back to the other if unavailable.
+    Tries the requested engine, falls back to the other if it fails or returns no text.
 
     Args:
         image: PIL Image object or path to image.
@@ -282,38 +283,57 @@ def ocr_image(image, engine="paddleocr", device="cpu", lang="en"):
     Returns:
         Extracted text as a string.
     """
+    text = ""
     if engine == "paddleocr":
         if is_paddleocr_available():
-            return paddleocr_image_to_string(image, device=device, lang=lang)
+            try:
+                text = paddleocr_image_to_string(image, device=device, lang=lang)
+            except Exception as e:
+                print(f"[OCR] PaddleOCR image extraction failed: {e}")
         else:
-            print("[OCR] PaddleOCR not available, falling back to Tesseract.")
+            print("[OCR] PaddleOCR not available.")
+            
+        if not text.strip():
+            print("[OCR] PaddleOCR failed or yielded no text. Switching to Tesseract as fallback...")
             if is_tesseract_available():
-                tess_lang = _lang_to_tesseract(lang)
-                return tesseract_image_to_string(image, lang=tess_lang)
+                try:
+                    tess_lang = _lang_to_tesseract(lang)
+                    text = tesseract_image_to_string(image, lang=tess_lang)
+                except Exception as e:
+                    print(f"[OCR] Tesseract fallback image extraction failed: {e}")
             else:
-                _log_error("<image>", "No OCR engine available (neither PaddleOCR nor Tesseract)")
-                return ""
+                print("[OCR] Tesseract fallback not available.")
+                
     elif engine == "tesseract":
         if is_tesseract_available():
-            tess_lang = _lang_to_tesseract(lang)
-            return tesseract_image_to_string(image, lang=tess_lang)
+            try:
+                tess_lang = _lang_to_tesseract(lang)
+                text = tesseract_image_to_string(image, lang=tess_lang)
+            except Exception as e:
+                print(f"[OCR] Tesseract image extraction failed: {e}")
         else:
-            print("[OCR] Tesseract not available, falling back to PaddleOCR.")
+            print("[OCR] Tesseract not available.")
+            
+        if not text.strip():
+            print("[OCR] Tesseract failed or yielded no text. Switching to PaddleOCR as fallback...")
             if is_paddleocr_available():
-                return paddleocr_image_to_string(image, device=device, lang=lang)
+                try:
+                    text = paddleocr_image_to_string(image, device=device, lang=lang)
+                except Exception as e:
+                    print(f"[OCR] PaddleOCR fallback image extraction failed: {e}")
             else:
-                _log_error("<image>", "No OCR engine available")
-                return ""
+                print("[OCR] PaddleOCR fallback not available.")
     else:
         raise ValueError(f"Unknown OCR engine: {engine}. Use 'paddleocr' or 'tesseract'.")
+
+    return text
 
 
 def ocr_pdf(pdf_path, engine="paddleocr", device="cpu", lang="en"):
     """
     Unified OCR interface: run OCR on a scanned PDF.
 
-    For PaddleOCR, processes the PDF directly (much faster).
-    For Tesseract, converts pages to images first via pdf2image.
+    Tries the requested engine, falls back to the other if it fails or returns no text.
 
     Args:
         pdf_path: Path to the PDF file.
@@ -324,16 +344,49 @@ def ocr_pdf(pdf_path, engine="paddleocr", device="cpu", lang="en"):
     Returns:
         Extracted text as a string.
     """
+    text = ""
     if engine == "paddleocr":
         if is_paddleocr_available():
-            return paddleocr_pdf_to_string(pdf_path, device=device, lang=lang)
+            try:
+                text = paddleocr_pdf_to_string(pdf_path, device=device, lang=lang)
+            except Exception as e:
+                print(f"[OCR] PaddleOCR PDF extraction failed: {e}")
         else:
-            print("[OCR] PaddleOCR not available for PDF, falling back to Tesseract.")
-            return _tesseract_pdf_fallback(pdf_path, lang)
+            print("[OCR] PaddleOCR not available for PDF.")
+            
+        if not text.strip():
+            print("[OCR] PaddleOCR failed or yielded no text. Switching to Tesseract as fallback...")
+            if is_tesseract_available():
+                try:
+                    text = _tesseract_pdf_fallback(pdf_path, lang)
+                except Exception as e:
+                    print(f"[OCR] Tesseract fallback PDF extraction failed: {e}")
+            else:
+                print("[OCR] Tesseract fallback not available.")
+                
     elif engine == "tesseract":
-        return _tesseract_pdf_fallback(pdf_path, lang)
+        if is_tesseract_available():
+            try:
+                text = _tesseract_pdf_fallback(pdf_path, lang)
+            except Exception as e:
+                print(f"[OCR] Tesseract PDF extraction failed: {e}")
+        else:
+            print("[OCR] Tesseract not available.")
+            
+        if not text.strip():
+            print("[OCR] Tesseract failed or yielded no text. Switching to PaddleOCR as fallback...")
+            if is_paddleocr_available():
+                try:
+                    text = paddleocr_pdf_to_string(pdf_path, device=device, lang=lang)
+                except Exception as e:
+                    print(f"[OCR] PaddleOCR fallback PDF extraction failed: {e}")
+            else:
+                print("[OCR] PaddleOCR fallback not available.")
     else:
         raise ValueError(f"Unknown OCR engine: {engine}")
+        
+    return text
+
 
 
 def _tesseract_pdf_fallback(pdf_path, lang):
