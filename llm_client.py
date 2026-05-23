@@ -86,7 +86,7 @@ class LLMClient:
         """Query /v1/models to auto-detect the loaded model on the vLLM server."""
         url = f"{self.vllm_url}/v1/models"
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
+            resp = requests.get(url, headers=headers, timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
                 models = data.get("data", [])
@@ -111,7 +111,7 @@ class LLMClient:
             "temperature": 0.7,
         }
 
-        resp = requests.post(chat_url, json=payload, headers=headers, timeout=300)
+        resp = requests.post(chat_url, json=payload, headers=headers, timeout=600)
 
         if resp.status_code == 404:
             # Chat endpoint doesn't exist, use completions
@@ -131,7 +131,7 @@ class LLMClient:
             "max_tokens": 8192,
             "temperature": 0.7,
         }
-        resp = requests.post(url, json=payload, headers=headers, timeout=300)
+        resp = requests.post(url, json=payload, headers=headers, timeout=600)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -146,7 +146,7 @@ class LLMClient:
             "max_tokens": 8192,
             "temperature": 0.7,
         }
-        resp = requests.post(url, json=payload, headers=headers, timeout=300)
+        resp = requests.post(url, json=payload, headers=headers, timeout=600)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["text"]
