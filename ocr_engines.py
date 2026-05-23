@@ -46,6 +46,7 @@ def is_paddleocr_available():
     global _paddleocr_available
     if _paddleocr_available is None:
         try:
+            import paddle  # noqa: F401
             from paddleocr import PaddleOCR  # noqa: F401
             _paddleocr_available = True
         except ImportError:
