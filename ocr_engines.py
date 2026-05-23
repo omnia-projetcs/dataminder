@@ -2,8 +2,8 @@
 OCR Engine abstraction for Dataminder.
 
 Supports two backends:
-  - paddleocr : PaddleOCR PP-OCRv5 (deep learning, default, much higher accuracy)
-  - tesseract : Legacy Tesseract OCR (fallback)
+  - tesseract : Legacy Tesseract OCR (default)
+  - paddleocr : PaddleOCR PP-OCRv5 (deep learning, much higher accuracy, enabled via options)
 
 PaddleOCR features integrated from https://github.com/PaddlePaddle/PaddleOCR:
   - PP-OCRv5 text detection + recognition (109 languages, 13% accuracy boost)
@@ -269,7 +269,7 @@ def tesseract_image_to_string(image, lang='fra+eng'):
 # Unified OCR Interface
 # ---------------------------------------------------------------------------
 
-def ocr_image(image, engine="paddleocr", device="cpu", lang="en"):
+def ocr_image(image, engine="tesseract", device="cpu", lang="en"):
     """
     Unified OCR interface: run OCR on a PIL Image.
 
@@ -330,7 +330,7 @@ def ocr_image(image, engine="paddleocr", device="cpu", lang="en"):
     return text
 
 
-def ocr_pdf(pdf_path, engine="paddleocr", device="cpu", lang="en"):
+def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en"):
     """
     Unified OCR interface: run OCR on a scanned PDF.
 

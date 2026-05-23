@@ -211,7 +211,8 @@ if __name__ == "__main__":
     parser.add_argument("--threads", type=int, nargs='?', const=5, default=None, help="Enable multithreaded chunk processing. Without a value, defaults to 5 threads. You can specify a custom number (e.g. --threads 8). Omit this flag entirely for sequential processing.")
     
     # OCR engine options (PaddleOCR integration)
-    parser.add_argument("--ocr-engine", default="paddleocr", choices=["paddleocr", "tesseract"], help="OCR engine to use: 'paddleocr' (PP-OCRv5, deep learning, default) or 'tesseract' (legacy). PaddleOCR is significantly more accurate.")
+    parser.add_argument("--ocr-engine", default="tesseract", choices=["paddleocr", "tesseract"], help="OCR engine to use: 'tesseract' (legacy, default) or 'paddleocr' (PP-OCRv5, deep learning).")
+    parser.add_argument("--paddleocr", action="store_true", help="Enable PaddleOCR PP-OCRv5 (deep learning, more accurate) instead of Tesseract.")
     parser.add_argument("--ocr-device", default="cpu", choices=["cpu", "gpu"], help="Device for OCR inference: 'cpu' (default) or 'gpu'. Only affects PaddleOCR.")
     parser.add_argument("--ocr-lang", default="en", help="Language hint for OCR engine (default: en). PaddleOCR supports 109 languages natively. Examples: en, fr, ch, de, es, ja, ko, ar.")
     parser.add_argument("--structured", action="store_true", help="Use PP-StructureV3 for layout-aware PDF parsing (extracts tables, formulas, headings as structured Markdown). Requires PaddleOCR with structure support.")
@@ -232,7 +233,8 @@ if __name__ == "__main__":
     num_threads = args.threads if args.threads else 1
     
     # Configure OCR engine
-    configure_ocr(engine=args.ocr_engine, device=args.ocr_device, lang=args.ocr_lang)
+    ocr_engine = "paddleocr" if args.paddleocr else args.ocr_engine
+    configure_ocr(engine=ocr_engine, device=args.ocr_device, lang=args.ocr_lang)
     
     # Configure Whisper transcription engine
     configure_whisper(model=args.whisper_model, device=args.whisper_device, lang=args.whisper_lang)

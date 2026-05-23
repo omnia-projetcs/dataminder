@@ -19,7 +19,7 @@ from transcriber import (
 )
 
 # Module-level OCR configuration (set by main.py based on CLI args)
-_ocr_engine = "paddleocr"
+_ocr_engine = "tesseract"
 _ocr_device = "cpu"
 _ocr_lang = "en"
 
@@ -29,12 +29,12 @@ _whisper_device = "cpu"
 _whisper_lang = None
 
 
-def configure_ocr(engine="paddleocr", device="cpu", lang="en"):
+def configure_ocr(engine="tesseract", device="cpu", lang="en"):
     """
     Configure the OCR engine for all extraction calls.
 
     Args:
-        engine: "paddleocr" (default, deep learning) or "tesseract" (legacy).
+        engine: "tesseract" (default, legacy) or "paddleocr" (deep learning).
         device: "cpu" or "gpu" (PaddleOCR only).
         lang: Language hint (e.g., "en", "fr", "ch").
     """

@@ -7,14 +7,14 @@
 ![Pandas](https://img.shields.io/badge/Data-Pandas-150458?logo=pandas&logoColor=white)
 ![BeautifulSoup](https://img.shields.io/badge/Web-BeautifulSoup-red)
 
-**Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, Images, Audio, Video, HTML) using deep-learning OCR powered by **PaddleOCR PP-OCRv5** (with Tesseract as legacy fallback) and speech-to-text transcription via **faster-whisper** (Whisper). Using local Large Language Models (LLMs) via **Ollama** or **vLLM**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
+**Dataminder** is a robust, privacy-first, offline document ingestion pipeline and fine-tuning dataset generator. It automates the extraction of text from diverse file formats (PDFs, Office Documents, Archives, Images, Audio, Video, HTML) using **Tesseract OCR** by default (with **PaddleOCR PP-OCRv5** as a deep-learning option) and speech-to-text transcription via **faster-whisper** (Whisper). Using local Large Language Models (LLMs) via **Ollama** or **vLLM**, Dataminder generates highly detailed, non-redundant Markdown summaries and structured Q&A JSON datasets (Alpaca/ShareGPT format) perfect for RAG (Retrieval-Augmented Generation) architectures and model fine-tuning.
 
 ## Why Dataminder?
 - **100% Offline & Private:** No API keys, no cloud data leaks. Everything runs locally on your machine.
 - **Automated ML Dataset Creation:** Seamlessly converts unstructured local documents into deduplicated Alpaca JSON datasets for AI training.
-- **Deep Learning OCR:** Powered by PaddleOCR PP-OCRv5 — 13% more accurate than previous generation, 109 languages, auto orientation/distortion correction.
+- **Deep Learning OCR:** PaddleOCR PP-OCRv5 available as an option — 13% more accurate than previous generation, 109 languages, auto orientation/distortion correction.
 - **Structured Document Parsing:** Optional PP-StructureV3 mode extracts tables, formulas, and layout as structured Markdown.
-- **Smart OCR Fallback:** Automatically detects scanned PDFs/images and applies OCR. Falls back to Tesseract if PaddleOCR is unavailable.
+- **Smart OCR Fallback:** Automatically detects scanned PDFs/images and applies OCR. Falls back to Tesseract or PaddleOCR depending on active options and availability.
 - **Fail-Safe Pipeline:** Continuous processing with automatic skipped files and comprehensive `error.log` generation.
 
 ## Supported Formats
@@ -101,9 +101,9 @@ Here are the most common commands you will need:
   ```bash
   python main.py --structured
   ```
-- **Use Tesseract instead of PaddleOCR:**
+- **Use PaddleOCR instead of Tesseract:**
   ```bash
-  python main.py --ocr-engine tesseract
+  python main.py --paddleocr
   ```
 - **Transcribe audio files:** Process audio files (mp3, wav, ogg, flac...) from `./source`:
   ```bash
@@ -216,7 +216,8 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 | `--vllm-url` | `http://localhost:8000` | vLLM server URL |
 | `--vllm-key` | *(empty)* | API key for vLLM (optional) |
 | `--threads` | *(off)* | Enable parallel chunk processing (default: 5 threads if activated, e.g. `--threads` or `--threads 8`) |
-| `--ocr-engine` | `paddleocr` | OCR engine: `paddleocr` (PP-OCRv5, deep learning) or `tesseract` (legacy) |
+| `--ocr-engine` | `tesseract` | OCR engine: `tesseract` (legacy, default) or `paddleocr` (PP-OCRv5, deep learning) |
+| `--paddleocr` | *(flag)* | Enable PaddleOCR PP-OCRv5 (deep learning) instead of Tesseract |
 | `--ocr-device` | `cpu` | Device for OCR inference: `cpu` or `gpu` (PaddleOCR only) |
 | `--ocr-lang` | `en` | Language hint for OCR (e.g., `en`, `fr`, `ch`, `de`, `ja`, `ko`) |
 | `--structured` | *(flag)* | Use PP-StructureV3 for layout-aware PDF parsing |
@@ -229,9 +230,13 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 
 ## OCR Engine Details
 
-### PaddleOCR PP-OCRv5 (Default)
+### Tesseract OCR (Default)
 
-PaddleOCR is the default OCR engine. It uses deep learning models from [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) for significantly better accuracy than Tesseract:
+Tesseract is the default OCR engine. It uses a lightweight, traditional OCR framework which has wide language support and low resource usage.
+
+### PaddleOCR PP-OCRv5 (Deep Learning Option)
+
+PaddleOCR can be enabled using `--paddleocr`. It uses deep learning models from [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) for significantly better accuracy:
 
 - **PP-OCRv5 text detection** — Deep learning based text zone detection
 - **PP-OCRv5 text recognition** — 13% more accurate than PP-OCRv4, 109 languages natively
@@ -249,9 +254,9 @@ When `--structured` is enabled, Dataminder uses PP-StructureV3 for layout-aware 
 - Converts formulas to LaTeX
 - Much better output quality for complex documents with mixed content
 
-### Tesseract (Legacy Fallback)
+### PaddleOCR Fallback
 
-Tesseract is kept as a fallback engine (`--ocr-engine tesseract`). PaddleOCR automatically falls back to Tesseract if the `paddleocr` package is not installed.
+PaddleOCR automatically falls back to Tesseract if it fails or if the deep learning packages are not installed/available.
 
 ## Audio & Video Transcription (faster-whisper)
 
