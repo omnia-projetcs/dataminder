@@ -232,7 +232,7 @@ def _load_raw_pairs(raw_path):
     return pairs
 
 
-def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_threads=1):
+def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_threads=1, force=False):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
 
@@ -243,6 +243,13 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     os.makedirs(dest_dir, exist_ok=True)
     
     raw_jsonl_path = os.path.join(dest_dir, "dataset_qa_raw.jsonl")
+    
+    if force and os.path.exists(raw_jsonl_path):
+        try:
+            os.remove(raw_jsonl_path)
+            print(f"Force option enabled: resetting raw Q&A data at {raw_jsonl_path}")
+        except Exception as e:
+            print(f"Warning: Could not remove {raw_jsonl_path}: {e}")
     
     files_to_process = []
     for root, _, files in os.walk(source_dir):
@@ -255,11 +262,20 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
         return
     
     # Check which files were already processed (resume support)
-    already_done = _load_already_processed(raw_jsonl_path)
+    already_done = _load_already_processed(raw_jsonl_path) if not force else set()
     if already_done:
         total_before = len(files_to_process)
         files_to_process = [f for f in files_to_process if os.path.basename(f) not in already_done]
         print(f"Resuming: {total_before - len(files_to_process)} files already processed, {len(files_to_process)} remaining.")
+        
+    dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
+    dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
+    
+    if not force and len(files_to_process) == 0:
+        if os.path.exists(dataset_json_path) and os.path.exists(dataset_md_path):
+            print("Resuming: Q&A dataset is already complete and all files have been processed. Skipping completely.")
+            llm_client.unload_model(model_name)
+            return
     
     total_saved = len(_load_raw_pairs(raw_jsonl_path))
         

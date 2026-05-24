@@ -249,7 +249,7 @@ if __name__ == "__main__":
         
         print("\n[Step 2/2] Q&A Dataset Generation")
         qa_dest = "dataresults" if args.dest == "destination" else f"{args.dest}_qa"
-        generate_qa_dataset(args.dest, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads)
+        generate_qa_dataset(args.dest, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force)
         print("\n--- Full Pipeline Complete ---")
     elif args.qa:
         from qa_generator import generate_qa_dataset
@@ -259,7 +259,7 @@ if __name__ == "__main__":
         qa_source = "destination" if args.source == "source" else args.source
         qa_dest = "dataresults" if args.dest == "destination" else args.dest
         
-        generate_qa_dataset(qa_source, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads)
+        generate_qa_dataset(qa_source, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force)
     else:
         print("--- Starting document processing ---")
         process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads, structured=args.structured)
