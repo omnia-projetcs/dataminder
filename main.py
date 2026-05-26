@@ -5,14 +5,14 @@ os.environ["FLAGS_use_mkldnn"] = "0"
 
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from extractor import extract_text, configure_ocr, configure_whisper
 from transcriber import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 from summarizer import summarize_text
 from llm_client import LLMClient
+from qa_generator import _split_into_chunks
 from tqdm import tqdm
-
-CHUNK_SIZE = 5000
 
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
@@ -95,24 +95,7 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
                 summary_md = text
             else:
                 # Split text into chunks to prevent context blowup for large documents
-                chunks = []
-                start = 0
-                while start < len(text):
-                    if len(text) - start <= CHUNK_SIZE:
-                        chunks.append(text[start:])
-                        break
-                    
-                    # Try to find a paragraph break to split cleanly
-                    split_point = text.rfind('\n\n', start, start + CHUNK_SIZE)
-                    if split_point == -1 or split_point <= start:
-                        # Fallback to newline
-                        split_point = text.rfind('\n', start, start + CHUNK_SIZE)
-                    if split_point == -1 or split_point <= start:
-                        # Fallback to hard split
-                        split_point = start + CHUNK_SIZE
-                        
-                    chunks.append(text[start:split_point].strip())
-                    start = split_point
+                chunks = _split_into_chunks(text)
 
                 if len(chunks) <= 1:
                     pbar.set_postfix({"file": filename[:20], "step": f"AI Summarizing (L{level})"})
@@ -122,7 +105,6 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
                     pbar.set_postfix({"file": filename[:20], "step": f"Done", "time": f"{elapsed:.1f}s"})
                 elif num_threads > 1:
                     # Parallel chunk processing
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
                     summaries_by_idx = {}
                     chunk_times = []
                     

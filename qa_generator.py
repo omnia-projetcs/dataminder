@@ -1,14 +1,37 @@
 import os
 import json
 import re
-import hashlib
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import difflib
 import datetime
 from llm_client import LLMClient
 
 CHUNK_SIZE = 5000
+
+
+def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
+    """Split text into chunks at paragraph or line boundaries."""
+    chunks = []
+    start = 0
+    while start < len(text):
+        if len(text) - start <= chunk_size:
+            chunks.append(text[start:])
+            break
+
+        # Try to find a paragraph break to split cleanly
+        split_point = text.rfind('\n\n', start, start + chunk_size)
+        if split_point == -1 or split_point <= start:
+            # Fallback to newline
+            split_point = text.rfind('\n', start, start + chunk_size)
+        if split_point == -1 or split_point <= start:
+            # Fallback to hard split
+            split_point = start + chunk_size
+
+        chunks.append(text[start:split_point].strip())
+        start = split_point
+    return chunks
 
 def log_error(filepath, error_msg):
     with open("error.log", "a", encoding="utf-8") as f:
@@ -189,12 +212,14 @@ def _get_ngrams(text, n=3):
 
 
 def _minhash_signature(shingles, num_hashes=64):
-    """Compute a MinHash signature for a set of shingles."""
+    """Compute a MinHash signature for a set of shingles.
+    Uses Python's built-in hash() with seed mixing instead of hashlib.md5
+    for ~20-50x faster hashing (non-cryptographic, fine for similarity)."""
     signature = []
     for i in range(num_hashes):
         min_hash = float('inf')
         for shingle in shingles:
-            h = int(hashlib.md5(f"{i}_{shingle}".encode('utf-8')).hexdigest(), 16)
+            h = hash((i, shingle)) & 0xFFFFFFFFFFFFFFFF  # ensure positive
             if h < min_hash:
                 min_hash = h
         signature.append(min_hash)
@@ -231,19 +256,19 @@ def deduplicate_qa(qa_list, threshold=0.85):
     if exact_removed:
         tqdm.write(f"  Removed {exact_removed} exact duplicates.")
 
-    # Phase 2: Build MinHash signatures + LSH index
+    # Phase 2: Build MinHash signatures + LSH index (cached)
     print(f"  Building similarity index for {len(deduped_exact)} pairs...")
     signatures = []
-    all_shingles = []
+    all_bands = []  # pre-cache LSH bands to avoid recomputing in phase 3
     for qa in tqdm(deduped_exact, desc="Indexing", unit="pair"):
         shingles = _get_ngrams(qa.get("question", ""), n=3)
-        all_shingles.append(shingles)
-        signatures.append(_minhash_signature(shingles, num_hashes))
+        sig = _minhash_signature(shingles, num_hashes)
+        signatures.append(sig)
+        all_bands.append(_lsh_buckets(sig, num_bands))
 
-    # Build LSH band buckets: band_hash -> list of indices
+    # Build LSH band buckets: (band_idx, band_hash) -> list of indices
     band_buckets = defaultdict(list)
-    for idx, sig in enumerate(signatures):
-        bands = _lsh_buckets(sig, num_bands)
+    for idx, bands in enumerate(all_bands):
         for band_idx, band_hash in enumerate(bands):
             band_buckets[(band_idx, band_hash)].append(idx)
 
@@ -253,11 +278,9 @@ def deduplicate_qa(qa_list, threshold=0.85):
         if idx in removed:
             continue
 
-        # Collect candidate indices from shared LSH bands
+        # Collect candidate indices from shared LSH bands (using cached bands)
         candidates = set()
-        sig = signatures[idx]
-        bands = _lsh_buckets(sig, num_bands)
-        for band_idx, band_hash in enumerate(bands):
+        for band_idx, band_hash in enumerate(all_bands[idx]):
             for cand_idx in band_buckets[(band_idx, band_hash)]:
                 if cand_idx > idx and cand_idx not in removed:
                     candidates.add(cand_idx)
@@ -360,7 +383,11 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
             llm_client.unload_model(model_name)
             return
     
-    total_saved = len(_load_raw_pairs(raw_jsonl_path))
+    # Count existing pairs without loading them all into memory
+    total_saved = 0
+    if os.path.exists(raw_jsonl_path):
+        with open(raw_jsonl_path, 'r', encoding='utf-8') as f:
+            total_saved = sum(1 for line in f if line.strip())
         
     if files_to_process:
         print(f"Processing {len(files_to_process)} Markdown files for Q&A generation...")
@@ -383,30 +410,12 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                     continue
                     
                 # Split text into chunks to prevent context blowup while processing entire files
-                chunks = []
-                start = 0
-                while start < len(text):
-                    if len(text) - start <= CHUNK_SIZE:
-                        chunks.append(text[start:])
-                        break
-                    
-                    # Try to find a paragraph break to split cleanly
-                    split_point = text.rfind('\n\n', start, start + CHUNK_SIZE)
-                    if split_point == -1 or split_point <= start:
-                        # Fallback to newline
-                        split_point = text.rfind('\n', start, start + CHUNK_SIZE)
-                    if split_point == -1 or split_point <= start:
-                        # Fallback to hard split
-                        split_point = start + CHUNK_SIZE
-                        
-                    chunks.append(text[start:split_point].strip())
-                    start = split_point
+                chunks = _split_into_chunks(text)
                 
                 qa_pairs = []
 
                 if num_threads > 1 and len(chunks) > 1:
                     # Parallel chunk processing
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
                     futures = {}
                     with ThreadPoolExecutor(max_workers=num_threads) as executor:
                         for chunk_idx, chunk in enumerate(chunks):
