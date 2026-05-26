@@ -8,7 +8,6 @@ from pptx import Presentation
 import pandas as pd
 import tempfile
 from bs4 import BeautifulSoup
-import datetime
 import ebooklib
 from ebooklib import epub
 
@@ -64,10 +63,10 @@ def configure_whisper(model="base", device="cpu", lang=None):
     print(f"[Whisper] Configured: model={model}, device={device}, lang={lang_display}")
 
 
+from logger import log_error as _log_error
+
 def log_error(filepath, error_msg):
-    with open("error.log", "a", encoding="utf-8") as f:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"[{timestamp}] FILE: {filepath} | EXTRACTION ERROR: {error_msg}\n")
+    _log_error(filepath, error_msg, category="EXTRACTION")
 
 def extract_text_from_txt(path):
     with open(path, 'r', encoding='utf-8') as f:

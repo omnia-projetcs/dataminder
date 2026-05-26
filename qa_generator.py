@@ -5,8 +5,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import difflib
-import datetime
+import time
+import random
 from llm_client import LLMClient
+from logger import log_error as _log_error
 
 CHUNK_SIZE = 5000
 
@@ -30,13 +32,12 @@ def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
             split_point = start + chunk_size
 
         chunks.append(text[start:split_point].strip())
-        start = split_point
+        # Advance past the split delimiter to guarantee forward progress
+        start = split_point + 1
     return chunks
 
 def log_error(filepath, error_msg):
-    with open("error.log", "a", encoding="utf-8") as f:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"[{timestamp}] FILE: {filepath} | QA GENERATION ERROR: {error_msg}\n")
+    _log_error(filepath, error_msg, category="QA GENERATION")
 
 def _sanitize_json_string(raw_json):
     """Sanitize a JSON string that may contain literal control characters
@@ -338,7 +339,7 @@ def _load_raw_pairs(raw_path):
     return pairs
 
 
-def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_threads=1, force=False):
+def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_threads=1, force=False, enrich=False, enrich_ratio=0.3):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
 
@@ -513,10 +514,11 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     
     print("Phase 4: Saving final clean files...")
     
+    # Standard Alpaca json format (built before the with-block so it's available for enrichment)
+    alpaca_format = [{"instruction": qa["question"], "input": "", "output": qa["answer"]} for qa in unique_qa_pairs]
+
     # Save JSON array
     with open(dataset_json_path, 'w', encoding='utf-8') as f_json:
-        # Standard Alpaca json format
-        alpaca_format = [{"instruction": qa["question"], "input": "", "output": qa["answer"]} for qa in unique_qa_pairs]
         json.dump(alpaca_format, f_json, ensure_ascii=False, indent=2)
         
     # Save Markdown
@@ -532,5 +534,113 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     print(f"Saved Markdown readable dataset to: {dataset_md_path}")
     print(f"Raw data preserved in: {raw_jsonl_path}")
 
+    # Phase 5: Post-deduplication enrichment (only in full pipeline mode)
+    if enrich and enrich_ratio > 0:
+        dataset_enriched_path = os.path.join(dest_dir, "dataset_qa_enriched.json")
+        enriched_pairs = _enrich_after_dedup(list(alpaca_format), ratio=enrich_ratio, model_name=model_name, llm_client=llm_client, output_path=dataset_enriched_path)
+        # Final save (also done incrementally inside the function for crash safety)
+        with open(dataset_enriched_path, 'w', encoding='utf-8') as f_enriched:
+            json.dump(enriched_pairs, f_enriched, ensure_ascii=False, indent=2)
+        enriched_count = sum(1 for e in enriched_pairs if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
+        print(f"Saved enriched dataset ({enriched_count} entries enriched) to: {dataset_enriched_path}")
+    elif enrich:
+        print("\nPhase 5: Enrichment skipped (enrich-ratio is 0).")
+
     # Unload model from VRAM (only for Ollama)
     llm_client.unload_model(model_name)
+
+
+def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:12b", llm_client=None, output_path=None):
+    """Enrich a fraction of the deduplicated dataset just before saving.
+
+    Uses the shared LLMClient abstraction so enrichment works with both
+    Ollama and vLLM providers.
+
+    Resume support: if output_path exists, loads it and skips entries
+    already enriched. Saves incrementally after each successful enrichment.
+    """
+    if ratio <= 0 or not qa_list:
+        return qa_list
+
+    if llm_client is None:
+        llm_client = LLMClient(provider="ollama")
+
+    # Resume: load existing enriched data if available
+    if output_path and os.path.exists(output_path):
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            if isinstance(existing, list) and len(existing) == len(qa_list):
+                # Restore already-enriched entries
+                already_done = 0
+                for i, entry in enumerate(existing):
+                    if isinstance(entry.get("_meta"), dict) and entry["_meta"].get("enriched"):
+                        qa_list[i] = entry
+                        already_done += 1
+                if already_done > 0:
+                    print(f"  Resuming enrichment: {already_done} entries already enriched.")
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"  [WARNING] Could not load existing enriched file for resume: {e}")
+
+    n_to_enrich = max(1, int(len(qa_list) * ratio))
+    indices = random.sample(range(len(qa_list)), min(n_to_enrich, len(qa_list)))
+
+    # Filter out indices that are already enriched (resume support)
+    indices = [i for i in indices if not (isinstance(qa_list[i].get("_meta"), dict) and qa_list[i]["_meta"].get("enriched"))]
+
+    if not indices:
+        enriched_total = sum(1 for e in qa_list if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
+        print(f"\nPhase 5: All {enriched_total} target entries already enriched. Skipping.")
+        return qa_list
+
+    system_prompt = (
+        "You are a cybersecurity expert. Transform the provided Q&A into a structured report. "
+        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
+        "\"input\" = credible technical context (logs, tool output, scenario). "
+        "\"output\" = structured report with: summary, MITRE ATT&CK (TXXXX), CVSS, recommendations, IOC. "
+        "No markdown, no explanation, no code fences — just the raw JSON object."
+    )
+
+    already_enriched = sum(1 for e in qa_list if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
+    total_target = already_enriched + len(indices)
+    print(f"\nPhase 5: Post-deduplication enrichment: {len(indices)} remaining / {total_target} target ({ratio*100:.0f}%)...")
+
+    enriched_count = 0
+    for idx in tqdm(indices, desc="Enriching", unit="entry"):
+        entry = qa_list[idx]
+        inst = entry.get("instruction", entry.get("question", ""))
+        ans = entry.get("output", entry.get("answer", ""))
+        if not inst or not ans:
+            continue
+
+        try:
+            content = llm_client.chat(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Question: {inst}\nAnswer: {ans}\n\nGenerate enriched input/output."}
+                ],
+                keep_alive=-1
+            )
+            start, end = content.find('{'), content.rfind('}') + 1
+            if start != -1 and end > start:
+                result = json.loads(content[start:end])
+                if "input" in result and "output" in result:
+                    qa_list[idx] = {
+                        "instruction": inst,
+                        "input": result["input"],
+                        "output": result["output"],
+                        "_meta": {"enriched": True, "model": model_name}
+                    }
+                    enriched_count += 1
+                    # Save incrementally to support resume on crash
+                    if output_path:
+                        with open(output_path, 'w', encoding='utf-8') as f_save:
+                            json.dump(qa_list, f_save, ensure_ascii=False, indent=2)
+        except Exception as e:
+            tqdm.write(f"  [FAIL] [{idx}] Error: {e}")
+        time.sleep(0.2)
+
+    final_total = sum(1 for e in qa_list if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
+    print(f"  Enrichment complete. {enriched_count} new + {already_enriched} resumed = {final_total} total enriched.\n")
+    return qa_list

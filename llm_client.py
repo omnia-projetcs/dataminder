@@ -7,7 +7,6 @@ Supports two providers:
 """
 
 import threading
-import ollama
 import requests
 
 
@@ -47,6 +46,7 @@ class LLMClient:
         if self.provider != "ollama":
             return
         try:
+            import ollama
             ollama.chat(model=model, messages=[
                 {'role': 'user', 'content': '.'}
             ], keep_alive=0)
@@ -54,6 +54,7 @@ class LLMClient:
             pass
 
     def _chat_ollama(self, model, messages, keep_alive):
+        import ollama
         kwargs = {"model": model, "messages": messages}
         if keep_alive is not None:
             kwargs["keep_alive"] = keep_alive
@@ -71,7 +72,7 @@ class LLMClient:
                 # Double-check after acquiring lock
                 if self._vllm_endpoint is None:
                     self._detect_model(headers)
-                    self._detect_endpoint(self._vllm_model or model, messages, headers)
+                    self._detect_endpoint(self._vllm_model or model, headers)
 
         # Use auto-detected model if available
         resolved_model = self._vllm_model or model
@@ -100,25 +101,31 @@ class LLMClient:
         except Exception as e:
             print(f"[vLLM] Could not query /v1/models ({e}), using --model value.")
 
-    def _detect_endpoint(self, model, messages, headers):
-        """Detect which endpoint the vLLM server supports using a real request."""
-        # Try /v1/chat/completions with the actual request
+    def _detect_endpoint(self, model, headers):
+        """Detect which endpoint the vLLM server supports using a lightweight probe.
+
+        Sends a minimal request (max_tokens=1) to /v1/chat/completions.
+        If it returns 404, fall back to /v1/completions.
+        The probe response is discarded since it's a throwaway check.
+        """
         chat_url = f"{self.vllm_url}/v1/chat/completions"
-        payload = {
+        probe_payload = {
             "model": model,
-            "messages": messages,
-            "max_tokens": 8192,
-            "temperature": 0.7,
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1,
         }
 
-        resp = requests.post(chat_url, json=payload, headers=headers, timeout=600)
+        try:
+            resp = requests.post(chat_url, json=probe_payload, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            print(f"[vLLM] Could not probe /v1/chat/completions ({e}), assuming /v1/completions")
+            self._vllm_endpoint = "completions"
+            return
 
         if resp.status_code == 404:
-            # Chat endpoint doesn't exist, use completions
             print(f"[vLLM] /v1/chat/completions not found (404), switching to /v1/completions")
             self._vllm_endpoint = "completions"
         else:
-            # Chat endpoint exists (even if the response is an error for another reason)
             self._vllm_endpoint = "chat"
             print(f"[vLLM] Using endpoint: /v1/chat/completions")
 

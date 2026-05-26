@@ -216,7 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Dataminder data directories
+data/*
 source/*
 destination/*
+dataresults/*
 venv/*
 

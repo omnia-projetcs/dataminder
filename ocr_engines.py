@@ -19,22 +19,21 @@ import os
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 
-import datetime
 from PIL import Image
+from logger import log_error as _shared_log_error
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded singletons — heavy imports only when actually needed
 # ---------------------------------------------------------------------------
 _paddleocr_instance = None
+_paddleocr_config = None  # (device, lang) tuple to detect config changes
 _paddleocr_structure_instance = None
 _tesseract_available = None
 _paddleocr_available = None
 
 
 def _log_error(filepath, error_msg):
-    with open("error.log", "a", encoding="utf-8") as f:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"[{timestamp}] FILE: {filepath} | OCR ENGINE ERROR: {error_msg}\n")
+    _shared_log_error(filepath, error_msg, category="OCR ENGINE")
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +77,16 @@ def _get_paddleocr(device="cpu", lang="en"):
 
     Uses PP-OCRv5 server models for maximum accuracy. The instance is
     created lazily on first call and reused for subsequent calls.
+    Reinitializes if device or lang settings change.
 
     Args:
         device: "cpu" or "gpu" for inference device.
         lang: Language hint ("en", "fr", "ch", etc.). Default "en".
               PP-OCRv5 handles multilingual natively so this is a hint.
     """
-    global _paddleocr_instance
-    if _paddleocr_instance is None:
+    global _paddleocr_instance, _paddleocr_config
+    current_config = (device, lang)
+    if _paddleocr_instance is None or _paddleocr_config != current_config:
         from paddleocr import PaddleOCR
         _paddleocr_instance = PaddleOCR(
             lang=lang,
@@ -95,6 +96,7 @@ def _get_paddleocr(device="cpu", lang="en"):
             device=device,
             enable_mkldnn=False,
         )
+        _paddleocr_config = current_config
         print(f"[PaddleOCR] Initialized PP-OCRv5 engine (device={device}, lang={lang})")
     return _paddleocr_instance
 

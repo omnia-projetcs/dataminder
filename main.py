@@ -6,18 +6,16 @@ os.environ["FLAGS_use_mkldnn"] = "0"
 import time
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from extractor import extract_text, configure_ocr, configure_whisper
 from transcriber import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 from summarizer import summarize_text
 from llm_client import LLMClient
 from qa_generator import _split_into_chunks
+from logger import log_error as _log_error
 from tqdm import tqdm
 
 def log_error(filepath, error_msg):
-    with open("error.log", "a", encoding="utf-8") as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"[{timestamp}] FILE: {filepath} | PIPELINE ERROR: {error_msg}\n")
+    _log_error(filepath, error_msg, category="PIPELINE")
 
 def process_documents(source_dir, dest_dir, model_name, level=7, force=False, llm_client=None, num_threads=1, structured=False):
     if llm_client is None:
@@ -178,12 +176,13 @@ def _summarize_chunk_timed(chunk, model_name, level, llm_client):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
-    parser.add_argument("--source", default="source", help="Source directory containing the documents to process (default: source).")
-    parser.add_argument("--dest", default="destination", help="Destination directory for the Markdown summaries (default: destination).")
+    parser.add_argument("--source", default=os.path.join("data", "source"), help="Source directory containing the documents to process (default: data/source).")
+    parser.add_argument("--dest", default=os.path.join("data", "export"), help="Destination directory for the Markdown summaries (default: data/export).")
     parser.add_argument("--model", default="gemma3:12b", help="Model to use (default: gemma3:12b).")
     parser.add_argument("--level", type=int, default=9, help="Summarization detail level from 1 to 10. 0 means no summarization (saves raw text). Default: 9.")
     parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
+    parser.add_argument("--enrich", action="store_true", help="Run enrichment only on an existing dataset_qa.json in data/results/.")
     parser.add_argument("--force", action="store_true", help="Force reprocessing of all files, ignoring resume state.")
     
     # vLLM / provider options
@@ -203,6 +202,9 @@ if __name__ == "__main__":
     parser.add_argument("--whisper-model", default="base", choices=["tiny", "base", "small", "medium", "large-v3"], help="Whisper model size for audio/video transcription (default: base). Larger models are more accurate but slower.")
     parser.add_argument("--whisper-device", default="cpu", choices=["cpu", "cuda"], help="Device for Whisper inference: 'cpu' (default) or 'cuda' (GPU).")
     parser.add_argument("--whisper-lang", default=None, help="Source language for transcription (e.g., 'en', 'fr'). Default: auto-detect.")
+
+    # RAG options
+    parser.add_argument('--enrich-ratio', type=float, default=0.3, help="Post-deduplication enrichment ratio (default: 0.3)")
     
     args = parser.parse_args()
     
@@ -230,18 +232,49 @@ if __name__ == "__main__":
         process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads, structured=args.structured)
         
         print("\n[Step 2/2] Q&A Dataset Generation")
-        qa_dest = "dataresults" if args.dest == "destination" else f"{args.dest}_qa"
-        generate_qa_dataset(args.dest, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force)
+        qa_dest = os.path.join("data", "results")
+        generate_qa_dataset(args.dest, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force, enrich=True, enrich_ratio=args.enrich_ratio)
         print("\n--- Full Pipeline Complete ---")
     elif args.qa:
         from qa_generator import generate_qa_dataset
         print("--- Starting Q&A Dataset Generation ---")
         
-        # Override defaults specifically for QA mode if they haven't been manually changed
-        qa_source = "destination" if args.source == "source" else args.source
-        qa_dest = "dataresults" if args.dest == "destination" else args.dest
+        # In QA mode: source defaults to data/export (summaries), dest to data/results
+        default_source = os.path.join("data", "source")
+        default_dest = os.path.join("data", "export")
+        qa_source = default_dest if args.source == default_source else args.source
+        qa_dest = os.path.join("data", "results") if args.dest == default_dest else args.dest
         
-        generate_qa_dataset(qa_source, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force)
+        generate_qa_dataset(qa_source, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force, enrich_ratio=args.enrich_ratio)
+    elif args.enrich:
+        import json
+        from qa_generator import _enrich_after_dedup
+        print("--- Starting Standalone Enrichment ---")
+        
+        results_dir = os.path.join("data", "results")
+        dataset_path = os.path.join(results_dir, "dataset_qa.json")
+        enriched_path = os.path.join(results_dir, "dataset_qa_enriched.json")
+        
+        if not os.path.exists(dataset_path):
+            print(f"ERROR: {dataset_path} not found. Run --qa or --full first to generate the dataset.")
+        else:
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                qa_list = json.load(f)
+            print(f"Loaded {len(qa_list)} entries from {dataset_path}")
+            
+            enriched = _enrich_after_dedup(
+                qa_list,
+                ratio=args.enrich_ratio,
+                model_name=args.model,
+                llm_client=llm_client,
+                output_path=enriched_path
+            )
+            with open(enriched_path, 'w', encoding='utf-8') as f:
+                json.dump(enriched, f, ensure_ascii=False, indent=2)
+            enriched_count = sum(1 for e in enriched if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
+            print(f"Saved enriched dataset ({enriched_count}/{len(enriched)} entries) to: {enriched_path}")
+            llm_client.unload_model(args.model)
+        print("\n--- Enrichment Complete ---")
     else:
         print("--- Starting document processing ---")
         process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads, structured=args.structured)

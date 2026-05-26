@@ -9,7 +9,7 @@ Video files have their audio track extracted via ffmpeg before transcription.
 import os
 import subprocess
 import tempfile
-import datetime
+from logger import log_error as _shared_log_error
 
 # Lazy-loaded faster-whisper model (singleton to avoid reloading)
 _whisper_model_instance = None
@@ -23,10 +23,8 @@ VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
 
 
 def _log_error(filepath, error_msg):
-    """Log transcription errors to error.log."""
-    with open("error.log", "a", encoding="utf-8") as f:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"[{timestamp}] FILE: {filepath} | TRANSCRIPTION ERROR: {error_msg}\n")
+    """Log transcription errors to data/error.log."""
+    _shared_log_error(filepath, error_msg, category="TRANSCRIPTION")
 
 
 def _get_model(model_size="base", device="cpu"):
