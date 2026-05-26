@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import hashlib
+from collections import defaultdict
 from tqdm import tqdm
 import difflib
 import datetime
@@ -178,19 +180,100 @@ def _references_source_material(qa):
     text = qa.get('question', '') + ' ' + qa.get('answer', '')
     return bool(_SOURCE_REF_PATTERNS.search(text))
 
+def _get_ngrams(text, n=3):
+    """Generate character n-grams (shingles) from text."""
+    text = text.lower().strip()
+    if len(text) < n:
+        return {text}
+    return {text[i:i+n] for i in range(len(text) - n + 1)}
+
+
+def _minhash_signature(shingles, num_hashes=64):
+    """Compute a MinHash signature for a set of shingles."""
+    signature = []
+    for i in range(num_hashes):
+        min_hash = float('inf')
+        for shingle in shingles:
+            h = int(hashlib.md5(f"{i}_{shingle}".encode('utf-8')).hexdigest(), 16)
+            if h < min_hash:
+                min_hash = h
+        signature.append(min_hash)
+    return tuple(signature)
+
+
+def _lsh_buckets(signature, num_bands=16):
+    """Split a MinHash signature into bands for LSH bucketing."""
+    band_size = len(signature) // num_bands
+    bands = []
+    for i in range(num_bands):
+        band = signature[i * band_size:(i + 1) * band_size]
+        bands.append(hash(band))
+    return bands
+
+
 def deduplicate_qa(qa_list, threshold=0.85):
-    unique_qa = []
-    for qa in tqdm(qa_list, desc="Deduplicating", unit="pair"):
-        is_duplicate = False
-        q_text = qa.get("question", "").lower()
-        for u_qa in unique_qa:
-            u_q_text = u_qa.get("question", "").lower()
-            # SequenceMatcher ratio > 0.85 means highly similar questions
-            if difflib.SequenceMatcher(None, q_text, u_q_text).ratio() > threshold:
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            unique_qa.append(qa)
+    if not qa_list:
+        return []
+
+    num_hashes = 64
+    num_bands = 16
+
+    # Phase 1: Exact dedup via normalized text hash
+    seen_exact = {}
+    deduped_exact = []
+    for qa in qa_list:
+        key = qa.get("question", "").lower().strip()
+        if key not in seen_exact:
+            seen_exact[key] = True
+            deduped_exact.append(qa)
+
+    exact_removed = len(qa_list) - len(deduped_exact)
+    if exact_removed:
+        tqdm.write(f"  Removed {exact_removed} exact duplicates.")
+
+    # Phase 2: Build MinHash signatures + LSH index
+    print(f"  Building similarity index for {len(deduped_exact)} pairs...")
+    signatures = []
+    all_shingles = []
+    for qa in tqdm(deduped_exact, desc="Indexing", unit="pair"):
+        shingles = _get_ngrams(qa.get("question", ""), n=3)
+        all_shingles.append(shingles)
+        signatures.append(_minhash_signature(shingles, num_hashes))
+
+    # Build LSH band buckets: band_hash -> list of indices
+    band_buckets = defaultdict(list)
+    for idx, sig in enumerate(signatures):
+        bands = _lsh_buckets(sig, num_bands)
+        for band_idx, band_hash in enumerate(bands):
+            band_buckets[(band_idx, band_hash)].append(idx)
+
+    # Phase 3: For each pair, check only LSH candidates with SequenceMatcher
+    removed = set()
+    for idx in tqdm(range(len(deduped_exact)), desc="Deduplicating", unit="pair"):
+        if idx in removed:
+            continue
+
+        # Collect candidate indices from shared LSH bands
+        candidates = set()
+        sig = signatures[idx]
+        bands = _lsh_buckets(sig, num_bands)
+        for band_idx, band_hash in enumerate(bands):
+            for cand_idx in band_buckets[(band_idx, band_hash)]:
+                if cand_idx > idx and cand_idx not in removed:
+                    candidates.add(cand_idx)
+
+        if not candidates:
+            continue
+
+        q_text = deduped_exact[idx].get("question", "").lower()
+        for cand_idx in candidates:
+            if cand_idx in removed:
+                continue
+            cand_text = deduped_exact[cand_idx].get("question", "").lower()
+            if difflib.SequenceMatcher(None, q_text, cand_text).ratio() > threshold:
+                removed.add(cand_idx)
+
+    unique_qa = [qa for idx, qa in enumerate(deduped_exact) if idx not in removed]
     return unique_qa
 
 def _load_already_processed(raw_path):
