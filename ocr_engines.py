@@ -151,37 +151,68 @@ def paddleocr_image_to_string(image, device="cpu", lang="en"):
         return ""
 
 
-def paddleocr_pdf_to_string(pdf_path, device="cpu", lang="en"):
+def paddleocr_pdf_to_string(pdf_path, device="cpu", lang="en", dpi=200, max_pages=0):
     """
     Run PaddleOCR on a PDF file and return all extracted text.
 
-    PaddleOCR can process PDF pages directly when given a file path,
-    handling multi-page documents automatically.
+    Processes page-by-page to avoid OOM on large scanned PDFs.
+    Each page is rendered to an image via PyMuPDF, OCR'd, then discarded.
 
     Args:
         pdf_path: Path to the PDF file.
         device: "cpu" or "gpu".
         lang: Language hint for PaddleOCR.
+        dpi: Resolution for rendering pages (default 200). Lower = less RAM.
+        max_pages: Maximum pages to process (0 = unlimited).
 
     Returns:
         Extracted text from all pages as a single string.
     """
+    import fitz
+    import numpy as np
+
     ocr = _get_paddleocr(device=device, lang=lang)
+    all_text = []
 
     try:
-        results = ocr.predict(pdf_path)
-        all_text = []
-        for page_res in results:
-            if hasattr(page_res, 'rec_texts') and page_res.rec_texts:
-                for text in page_res.rec_texts:
-                    if text and text.strip():
-                        all_text.append(text.strip())
-            elif hasattr(page_res, 'text') and page_res.text:
-                all_text.append(page_res.text.strip())
-        return "\n".join(all_text)
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        pages_to_process = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+
+        if max_pages > 0 and total_pages > max_pages:
+            print(f"[PaddleOCR] PDF has {total_pages} pages, limiting to {max_pages} (use --ocr-max-pages to change)")
+
+        zoom = dpi / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+
+        for page_num in range(pages_to_process):
+            try:
+                page = doc[page_num]
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                img_np = np.array(img)
+                # Release pixmap memory immediately
+                del pix
+
+                results = ocr.predict(img_np)
+                del img_np, img
+
+                for res in results:
+                    if hasattr(res, 'rec_texts') and res.rec_texts:
+                        for text in res.rec_texts:
+                            if text and text.strip():
+                                all_text.append(text.strip())
+                    elif hasattr(res, 'text') and res.text:
+                        all_text.append(res.text.strip())
+            except Exception as e:
+                print(f"[PaddleOCR] Failed on page {page_num + 1}/{pages_to_process}: {e}")
+                continue
+
+        doc.close()
     except Exception as e:
         _log_error(pdf_path, f"PaddleOCR PDF processing failed: {e}")
-        return ""
+
+    return "\n".join(all_text)
 
 
 # ---------------------------------------------------------------------------
@@ -332,17 +363,20 @@ def ocr_image(image, engine="tesseract", device="cpu", lang="en"):
     return text
 
 
-def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en"):
+def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en", dpi=200, max_pages=0):
     """
     Unified OCR interface: run OCR on a scanned PDF.
 
     Tries the requested engine, falls back to the other if it fails or returns no text.
+    Processes pages one at a time to prevent OOM on large scanned PDFs.
 
     Args:
         pdf_path: Path to the PDF file.
         engine: "paddleocr" or "tesseract".
         device: "cpu" or "gpu" (only for paddleocr).
         lang: Language hint.
+        dpi: Resolution for page rendering (default 200). Lower = less RAM.
+        max_pages: Maximum pages to process (0 = unlimited).
 
     Returns:
         Extracted text as a string.
@@ -351,7 +385,7 @@ def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en"):
     if engine == "paddleocr":
         if is_paddleocr_available():
             try:
-                text = paddleocr_pdf_to_string(pdf_path, device=device, lang=lang)
+                text = paddleocr_pdf_to_string(pdf_path, device=device, lang=lang, dpi=dpi, max_pages=max_pages)
             except Exception as e:
                 print(f"[OCR] PaddleOCR PDF extraction failed: {e}")
         else:
@@ -361,7 +395,7 @@ def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en"):
             print("[OCR] PaddleOCR failed or yielded no text. Switching to Tesseract as fallback...")
             if is_tesseract_available():
                 try:
-                    text = _tesseract_pdf_fallback(pdf_path, lang)
+                    text = _tesseract_pdf_fallback(pdf_path, lang, dpi=dpi, max_pages=max_pages)
                 except Exception as e:
                     print(f"[OCR] Tesseract fallback PDF extraction failed: {e}")
             else:
@@ -370,7 +404,7 @@ def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en"):
     elif engine == "tesseract":
         if is_tesseract_available():
             try:
-                text = _tesseract_pdf_fallback(pdf_path, lang)
+                text = _tesseract_pdf_fallback(pdf_path, lang, dpi=dpi, max_pages=max_pages)
             except Exception as e:
                 print(f"[OCR] Tesseract PDF extraction failed: {e}")
         else:
@@ -380,7 +414,7 @@ def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en"):
             print("[OCR] Tesseract failed or yielded no text. Switching to PaddleOCR as fallback...")
             if is_paddleocr_available():
                 try:
-                    text = paddleocr_pdf_to_string(pdf_path, device=device, lang=lang)
+                    text = paddleocr_pdf_to_string(pdf_path, device=device, lang=lang, dpi=dpi, max_pages=max_pages)
                 except Exception as e:
                     print(f"[OCR] PaddleOCR fallback PDF extraction failed: {e}")
             else:
@@ -392,19 +426,48 @@ def ocr_pdf(pdf_path, engine="tesseract", device="cpu", lang="en"):
 
 
 
-def _tesseract_pdf_fallback(pdf_path, lang):
-    """Convert PDF to images and OCR with Tesseract (legacy method)."""
+def _tesseract_pdf_fallback(pdf_path, lang, dpi=200, max_pages=0):
+    """
+    Convert PDF to images and OCR with Tesseract (legacy method).
+
+    Processes page-by-page using PyMuPDF to avoid loading all images into
+    memory at once (which caused OOM kills on large scanned PDFs).
+    """
     if not is_tesseract_available():
         _log_error(pdf_path, "Tesseract not available for PDF OCR fallback")
         return ""
     try:
-        from pdf2image import convert_from_path
-        images = convert_from_path(pdf_path)
-        text = ""
+        import fitz
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        pages_to_process = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+
+        if max_pages > 0 and total_pages > max_pages:
+            print(f"[Tesseract] PDF has {total_pages} pages, limiting to {max_pages} (use --ocr-max-pages to change)")
+
+        zoom = dpi / 72.0
+        mat = fitz.Matrix(zoom, zoom)
         tess_lang = _lang_to_tesseract(lang)
-        for img in images:
-            text += tesseract_image_to_string(img, lang=tess_lang) + "\n"
-        return text
+        text_parts = []
+
+        for page_num in range(pages_to_process):
+            try:
+                page = doc[page_num]
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                del pix  # Release pixmap memory immediately
+
+                page_text = tesseract_image_to_string(img, lang=tess_lang)
+                del img  # Release image memory immediately
+
+                if page_text:
+                    text_parts.append(page_text)
+            except Exception as e:
+                print(f"[Tesseract] Failed on page {page_num + 1}/{pages_to_process}: {e}")
+                continue
+
+        doc.close()
+        return "\n".join(text_parts)
     except Exception as e:
         _log_error(pdf_path, f"Tesseract PDF fallback failed: {e}")
         return ""

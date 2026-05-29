@@ -197,6 +197,8 @@ if __name__ == "__main__":
     parser.add_argument("--ocr-device", default="cpu", choices=["cpu", "gpu"], help="Device for OCR inference: 'cpu' (default) or 'gpu'. Only affects PaddleOCR.")
     parser.add_argument("--ocr-lang", default="en", help="Language hint for OCR engine (default: en). PaddleOCR supports 109 languages natively. Examples: en, fr, ch, de, es, ja, ko, ar.")
     parser.add_argument("--structured", action="store_true", help="Use PP-StructureV3 for layout-aware PDF parsing (extracts tables, formulas, headings as structured Markdown). Requires PaddleOCR with structure support.")
+    parser.add_argument("--ocr-dpi", type=int, default=200, help="DPI resolution for rendering scanned PDF pages during OCR (default: 200). Lower values use less RAM but may reduce accuracy. Range: 72-600.")
+    parser.add_argument("--ocr-max-pages", type=int, default=0, help="Maximum number of pages to OCR per PDF (default: 0 = unlimited). Use this to prevent OOM on very large scanned PDFs.")
     
     # Whisper transcription options (audio/video)
     parser.add_argument("--whisper-model", default="base", choices=["tiny", "base", "small", "medium", "large-v3"], help="Whisper model size for audio/video transcription (default: base). Larger models are more accurate but slower.")
@@ -218,7 +220,7 @@ if __name__ == "__main__":
     
     # Configure OCR engine
     ocr_engine = "paddleocr" if args.paddleocr else args.ocr_engine
-    configure_ocr(engine=ocr_engine, device=args.ocr_device, lang=args.ocr_lang)
+    configure_ocr(engine=ocr_engine, device=args.ocr_device, lang=args.ocr_lang, dpi=args.ocr_dpi, max_pages=args.ocr_max_pages)
     
     # Configure Whisper transcription engine
     configure_whisper(model=args.whisper_model, device=args.whisper_device, lang=args.whisper_lang)

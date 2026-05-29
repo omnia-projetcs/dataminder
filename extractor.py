@@ -21,6 +21,8 @@ from transcriber import (
 _ocr_engine = "tesseract"
 _ocr_device = "cpu"
 _ocr_lang = "en"
+_ocr_dpi = 200
+_ocr_max_pages = 0
 
 # Module-level Whisper configuration (set by main.py based on CLI args)
 _whisper_model = "base"
@@ -28,7 +30,7 @@ _whisper_device = "cpu"
 _whisper_lang = None
 
 
-def configure_ocr(engine="tesseract", device="cpu", lang="en"):
+def configure_ocr(engine="tesseract", device="cpu", lang="en", dpi=200, max_pages=0):
     """
     Configure the OCR engine for all extraction calls.
 
@@ -36,14 +38,25 @@ def configure_ocr(engine="tesseract", device="cpu", lang="en"):
         engine: "tesseract" (default, legacy) or "paddleocr" (deep learning).
         device: "cpu" or "gpu" (PaddleOCR only).
         lang: Language hint (e.g., "en", "fr", "ch").
+        dpi: Resolution for rendering scanned PDF pages (default 200).
+             Lower values use less RAM. Range: 72-600.
+        max_pages: Maximum pages to OCR per PDF (0 = unlimited).
     """
-    global _ocr_engine, _ocr_device, _ocr_lang
+    global _ocr_engine, _ocr_device, _ocr_lang, _ocr_dpi, _ocr_max_pages
     _ocr_engine = engine
     _ocr_device = device
     _ocr_lang = lang
+    _ocr_dpi = max(72, min(600, dpi))
+    _ocr_max_pages = max(0, max_pages)
 
     engine_name = "PaddleOCR PP-OCRv5" if engine == "paddleocr" else "Tesseract"
-    print(f"[OCR] Configured: engine={engine_name}, device={device}, lang={lang}")
+    extras = []
+    if dpi != 200:
+        extras.append(f"dpi={_ocr_dpi}")
+    if max_pages > 0:
+        extras.append(f"max_pages={_ocr_max_pages}")
+    extra_str = f", {', '.join(extras)}" if extras else ""
+    print(f"[OCR] Configured: engine={engine_name}, device={device}, lang={lang}{extra_str}")
 
 
 def configure_whisper(model="base", device="cpu", lang=None):
@@ -129,7 +142,7 @@ def extract_text_from_pdf_ocr(path):
       - Traditional LSTM-based OCR
     """
     try:
-        return ocr_pdf(path, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang)
+        return ocr_pdf(path, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang, dpi=_ocr_dpi, max_pages=_ocr_max_pages)
     except Exception as e:
         log_error(path, f"Failed to extract text via OCR ({_ocr_engine}). Error: {e}")
         return ""
