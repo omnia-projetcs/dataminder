@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import signal
+import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -11,6 +13,26 @@ from llm_client import LLMClient
 from logger import log_error as _log_error
 
 CHUNK_SIZE = 5000
+
+# --- Graceful shutdown on SIGTERM / SIGINT ---
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    """Handle SIGTERM/SIGINT by setting a flag so the processing loop
+    can finish the current chunk, flush to disk, and exit cleanly."""
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        tqdm.write(f"\n  [SIGNAL] Received {sig_name} — finishing current chunk and saving progress...")
+    else:
+        tqdm.write(f"\n  [SIGNAL] Received {sig_name} again — forcing exit.")
+        sys.exit(1)
+
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
 
 
 def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
@@ -484,6 +506,13 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                 else:
                     # Sequential chunk processing (default) — flush after each chunk
                     for chunk_idx, chunk in enumerate(chunks):
+                        if _shutdown_requested:
+                            tqdm.write(f"\n  [SHUTDOWN] Stopping gracefully. Progress saved ({total_saved} pairs on disk). Resume will pick up here.")
+                            pbar.close()
+                            print(f"\nGraceful shutdown complete. {total_saved} total Q&A pairs saved to: {raw_jsonl_path}")
+                            print("Re-run the same command to resume from where you left off.")
+                            llm_client.unload_model(model_name)
+                            return
                         if not chunk:
                             continue
                         if chunk_idx in done_chunks:
