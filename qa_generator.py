@@ -301,8 +301,14 @@ def deduplicate_qa(qa_list, threshold=0.85):
     return unique_qa
 
 def _load_already_processed(raw_path):
-    """Read the raw JSONL file and return a set of source filenames already processed."""
-    done = set()
+    """Read the raw JSONL file and return chunk-level resume state.
+
+    Returns:
+        dict[str, set[int]]: mapping of source filename -> set of chunk indices
+        already processed.  Entries without a ``_chunk_idx`` field (legacy format)
+        are treated as chunk -1 which causes the whole file to be considered done.
+    """
+    done = defaultdict(set)
     if not os.path.exists(raw_path):
         return done
     with open(raw_path, 'r', encoding='utf-8') as f:
@@ -314,7 +320,8 @@ def _load_already_processed(raw_path):
                 obj = json.loads(line)
                 src = obj.get("_source_file", "")
                 if src:
-                    done.add(src)
+                    chunk_idx = obj.get("_chunk_idx", -1)
+                    done[src].add(chunk_idx)
             except json.JSONDecodeError:
                 continue
     return done
@@ -368,12 +375,18 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
         print(f"No Markdown (.md) files found in '{source_dir}'.")
         return
     
-    # Check which files were already processed (resume support)
-    already_done = _load_already_processed(raw_jsonl_path) if not force else set()
+    # Check which files/chunks were already processed (resume support)
+    already_done = _load_already_processed(raw_jsonl_path) if not force else defaultdict(set)
+    # Files where legacy entries (no _chunk_idx) exist are considered fully done
+    fully_done_files = {f for f, chunks in already_done.items() if -1 in chunks}
+    partially_done_files = {f for f in already_done if f not in fully_done_files}
     if already_done:
         total_before = len(files_to_process)
-        files_to_process = [f for f in files_to_process if os.path.basename(f) not in already_done]
-        print(f"Resuming: {total_before - len(files_to_process)} files already processed, {len(files_to_process)} remaining.")
+        # Remove fully-processed files; keep partially-processed ones for chunk-level resume
+        files_to_process = [f for f in files_to_process if os.path.basename(f) not in fully_done_files]
+        skipped = total_before - len(files_to_process)
+        partial_msg = f" ({len(partially_done_files)} partially done — will resume at chunk level)" if partially_done_files else ""
+        print(f"Resuming: {skipped} files already processed, {len(files_to_process)} remaining.{partial_msg}")
         
     dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
     dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
@@ -413,14 +426,40 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                 # Split text into chunks to prevent context blowup while processing entire files
                 chunks = _split_into_chunks(text)
                 
-                qa_pairs = []
+                # Determine which chunks were already processed (chunk-level resume)
+                done_chunks = already_done.get(filename, set())
+                
+                file_count = 0
+                filtered_count = 0
+                chunk_errors = 0
+
+                def _flush_chunk_pairs(chunk_pairs, chunk_idx):
+                    """Write Q&A pairs from one chunk to disk immediately."""
+                    nonlocal file_count, filtered_count, total_saved
+                    if not isinstance(chunk_pairs, list):
+                        return
+                    with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
+                        for qa in chunk_pairs:
+                            if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
+                                if _references_source_material(qa):
+                                    filtered_count += 1
+                                    continue
+                                record = {
+                                    "question": qa['question'],
+                                    "answer": qa['answer'],
+                                    "_source_file": filename,
+                                    "_chunk_idx": chunk_idx
+                                }
+                                f_raw.write(json.dumps(record, ensure_ascii=False) + "\n")
+                                file_count += 1
+                                total_saved += 1
 
                 if num_threads > 1 and len(chunks) > 1:
-                    # Parallel chunk processing
+                    # Parallel chunk processing — flush per chunk as results arrive
                     futures = {}
                     with ThreadPoolExecutor(max_workers=num_threads) as executor:
                         for chunk_idx, chunk in enumerate(chunks):
-                            if not chunk:
+                            if not chunk or chunk_idx in done_chunks:
                                 continue
                             future = executor.submit(
                                 generate_qa_from_text, chunk,
@@ -432,54 +471,49 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
 
                         completed = 0
                         for future in as_completed(futures):
+                            chunk_idx = futures[future]
                             completed += 1
-                            pbar.set_postfix({"file": filename[:20], "chunks": f"{completed}/{len(futures)}", "q_saved": total_saved})
-                            chunk_pairs = future.result()
-                            if isinstance(chunk_pairs, list):
-                                qa_pairs.extend(chunk_pairs)
+                            pbar.set_postfix({"file": filename[:20], "chunk": f"{completed}/{len(futures)}", "q_saved": total_saved})
+                            try:
+                                chunk_pairs = future.result()
+                                _flush_chunk_pairs(chunk_pairs, chunk_idx)
+                            except Exception as e:
+                                chunk_errors += 1
+                                log_error(input_path, f"Chunk {chunk_idx}: {e}")
+                                tqdm.write(f"  [{filename}] chunk {chunk_idx} error: {e}")
                 else:
-                    # Sequential chunk processing (default)
+                    # Sequential chunk processing (default) — flush after each chunk
                     for chunk_idx, chunk in enumerate(chunks):
                         if not chunk:
+                            continue
+                        if chunk_idx in done_chunks:
                             continue
                         if len(chunks) > 1:
                             pbar.set_postfix({"file": filename[:20], "chunk": f"{chunk_idx+1}/{len(chunks)}", "q_saved": total_saved})
                         
-                        chunk_pairs = generate_qa_from_text(chunk, model_name=model_name, source_file=input_path, llm_client=llm_client)
-                        if isinstance(chunk_pairs, list):
-                            qa_pairs.extend(chunk_pairs)
-                                
-                if isinstance(qa_pairs, list):
-                    file_count = 0
-                    filtered_count = 0
-                    # Write each valid pair immediately to the raw JSONL file
-                    with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
-                        for qa in qa_pairs:
-                            if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
-                                # Filter out pairs that reference source material
-                                if _references_source_material(qa):
-                                    filtered_count += 1
-                                    continue
-                                record = {
-                                    "question": qa['question'],
-                                    "answer": qa['answer'],
-                                    "_source_file": filename
-                                }
-                                f_raw.write(json.dumps(record, ensure_ascii=False) + "\n")
-                                file_count += 1
-                                total_saved += 1
-                    if file_count == 0:
-                        failed_files += 1
-                        tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
-                    else:
-                        msg = f"  [{filename}] +{file_count} pairs saved"
-                        if filtered_count:
-                            msg += f" ({filtered_count} filtered: source refs)"
-                        msg += f" (total: {total_saved})"
-                        tqdm.write(msg)
+                        try:
+                            chunk_pairs = generate_qa_from_text(chunk, model_name=model_name, source_file=input_path, llm_client=llm_client)
+                            _flush_chunk_pairs(chunk_pairs, chunk_idx)
+                        except Exception as e:
+                            chunk_errors += 1
+                            log_error(input_path, f"Chunk {chunk_idx}: {e}")
+                            tqdm.write(f"  [{filename}] chunk {chunk_idx} error: {e}")
+                            continue
+
+                if file_count == 0 and chunk_errors == 0:
+                    failed_files += 1
+                    tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
+                elif file_count > 0:
+                    msg = f"  [{filename}] +{file_count} pairs saved"
+                    if filtered_count:
+                        msg += f" ({filtered_count} filtered: source refs)"
+                    if chunk_errors:
+                        msg += f" ({chunk_errors} chunk errors)"
+                    msg += f" (total: {total_saved})"
+                    tqdm.write(msg)
                 else:
                     failed_files += 1
-                    log_error(input_path, "AI did not return a valid list of QA pairs.")
+                    log_error(input_path, f"All {chunk_errors} chunks failed.")
             except Exception as e:
                 failed_files += 1
                 log_error(input_path, f"Unexpected exception: {str(e)}")
