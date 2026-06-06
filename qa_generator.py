@@ -58,6 +58,24 @@ def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
         start = split_point + 1
     return chunks
 
+
+def _is_junk_chunk(text, min_alpha_ratio=0.30, min_alpha_chars=40):
+    """Return True if the chunk is mostly punctuation/whitespace garbage.
+
+    A chunk is considered junk when:
+    - Less than *min_alpha_ratio* of its characters are alphanumeric, OR
+    - It contains fewer than *min_alpha_chars* letters/digits total.
+    """
+    if not text or not text.strip():
+        return True
+    total = len(text)
+    alpha_count = sum(1 for c in text if c.isalnum())
+    if alpha_count < min_alpha_chars:
+        return True
+    if alpha_count / total < min_alpha_ratio:
+        return True
+    return False
+
 def log_error(filepath, error_msg):
     _log_error(filepath, error_msg, category="QA GENERATION")
 
@@ -537,6 +555,8 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                         for chunk_idx, chunk in enumerate(chunks):
                             if not chunk or chunk_idx in done_chunks:
                                 continue
+                            if _is_junk_chunk(chunk):
+                                continue
                             future = executor.submit(
                                 generate_qa_from_text, chunk,
                                 model_name=model_name,
@@ -570,6 +590,8 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                         if not chunk:
                             continue
                         if chunk_idx in done_chunks:
+                            continue
+                        if _is_junk_chunk(chunk):
                             continue
                         if len(chunks) > 1:
                             pbar.set_postfix({"file": filename[:20], "chunk": f"{chunk_idx+1}/{len(chunks)}", "q_saved": total_saved})
