@@ -39,9 +39,9 @@ pip install --upgrade pip
 # Installs the Python dependencies listed in requirements.txt
 pip install -r requirements.txt
 
-echo -e "\n[3/3] Downloading the Ollama model (gemma3:12b)..."
+echo -e "\n[3/3] Downloading the Ollama model (gemma3:4b-it-q4_K_M)..."
 echo "Please make sure Ollama is running in the background or another terminal."
-ollama pull gemma3:12b || echo "Failed to pull the model. You can run 'ollama pull gemma3:12b' manually later."
+ollama pull gemma3:4b-it-q4_K_M || echo "Failed to pull the model. You can run 'ollama pull gemma3:4b-it-q4_K_M' manually later."
 
 echo -e "\n=========================================="
 echo "Installation completed successfully!"

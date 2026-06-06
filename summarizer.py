@@ -33,7 +33,7 @@ def _clean_output(text):
     return text.strip()
 
 
-def summarize_text(text, model_name="gemma3:12b", level=7, llm_client=None):
+def summarize_text(text, model_name="gemma3:4b-it-q4_K_M", level=7, llm_client=None):
     if not text or not text.strip():
         return "No text provided for summarization."
 

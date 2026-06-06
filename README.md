@@ -57,7 +57,7 @@ dataminder/
 - Linux (Ubuntu/Debian) or macOS
 - Python 3.8+
 - [Ollama](https://ollama.com/) installed and running locally.
-- An Ollama model downloaded (e.g., `gemma3:12b`, `mistral`). To download a model, run in your terminal: `ollama pull gemma3:12b`.
+- An Ollama model downloaded (e.g., `gemma3:4b-it-q4_K_M`, `mistral`). To download a model, run in your terminal: `ollama pull gemma3:4b-it-q4_K_M`.
 
 ## Installation
 
@@ -159,7 +159,7 @@ Here are the most common commands you will need:
 ### Detailed Commands
 
 2. **Run the processing**:
-   The script can be run without any arguments. By default, it looks for documents in `data/source/`, saves the summaries in `data/export/`, uses the `gemma3:12b` model, and applies a summarization level of `9`.
+   The script can be run without any arguments. By default, it looks for documents in `data/source/`, saves the summaries in `data/export/`, uses the `gemma3:4b-it-q4_K_M` model, and applies a summarization level of `9`.
    ```bash
    python main.py
    ```
@@ -271,7 +271,7 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 |---|---|---|
 | `--source` | `data/source` | Source directory for documents |
 | `--dest` | `data/export` | Destination directory for summaries |
-| `--model` | `gemma3:12b` | Model name to use |
+| `--model` | `gemma3:4b-it-q4_K_M` | Model name to use |
 | `--level` | `9` | Summarization detail (0-10, 0 = raw text) |
 | `--provider` | `ollama` | LLM provider: `ollama` or `vllm` |
 | `--vllm-url` | `http://localhost:8000` | vLLM server URL |

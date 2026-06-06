@@ -178,7 +178,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
     parser.add_argument("--source", default=os.path.join("data", "source"), help="Source directory containing the documents to process (default: data/source).")
     parser.add_argument("--dest", default=os.path.join("data", "export"), help="Destination directory for the Markdown summaries (default: data/export).")
-    parser.add_argument("--model", default="gemma3:12b", help="Model to use (default: gemma3:12b).")
+    parser.add_argument("--model", default="gemma3:4b-it-q4_K_M", help="Model to use (default: gemma3:4b-it-q4_K_M).")
     parser.add_argument("--level", type=int, default=9, help="Summarization detail level from 1 to 10. 0 means no summarization (saves raw text). Default: 9.")
     parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")

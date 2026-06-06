@@ -260,7 +260,7 @@ def _try_parse_enrichment_json(content):
     return None
 
 
-def generate_qa_from_text(text, model_name="gemma3:12b", source_file="N/A", llm_client=None):
+def generate_qa_from_text(text, model_name="gemma3:4b-it-q4_K_M", source_file="N/A", llm_client=None):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
 
@@ -758,7 +758,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     llm_client.unload_model(model_name)
 
 
-def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:12b", llm_client=None, output_path=None):
+def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", llm_client=None, output_path=None):
     """Enrich a fraction of the deduplicated dataset just before saving.
 
     Uses the shared LLMClient abstraction so enrichment works with both
