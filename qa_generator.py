@@ -59,17 +59,21 @@ def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
     return chunks
 
 
-def _is_junk_chunk(text, min_alpha_ratio=0.30, min_alpha_chars=40):
+def _is_junk_chunk(text, min_alpha_ratio=0.30, min_alpha_chars=40, absolute_alpha_threshold=150):
     """Return True if the chunk is mostly punctuation/whitespace garbage.
 
     A chunk is considered junk when:
-    - Less than *min_alpha_ratio* of its characters are alphanumeric, OR
-    - It contains fewer than *min_alpha_chars* letters/digits total.
+    - It contains fewer than *min_alpha_chars* letters/digits total, OR
+    - Less than *min_alpha_ratio* of its characters are alphanumeric AND
+      it contains fewer than *absolute_alpha_threshold* letters/digits total.
     """
     if not text or not text.strip():
         return True
     total = len(text)
     alpha_count = sum(1 for c in text if c.isalnum())
+    # If the chunk has a substantial absolute amount of readable text, it is not junk
+    if alpha_count >= absolute_alpha_threshold:
+        return False
     if alpha_count < min_alpha_chars:
         return True
     if alpha_count / total < min_alpha_ratio:
@@ -77,7 +81,7 @@ def _is_junk_chunk(text, min_alpha_ratio=0.30, min_alpha_chars=40):
     return False
 
 
-def _is_junk_qa(qa, min_alpha_ratio=0.40, min_question_len=10, min_answer_len=10):
+def _is_junk_qa(qa, min_alpha_ratio=0.40, min_question_len=10, min_answer_len=10, absolute_alpha_threshold=50):
     """Return True if a Q&A pair contains junk/garbage content.
 
     Detects:
@@ -97,6 +101,9 @@ def _is_junk_qa(qa, min_alpha_ratio=0.40, min_question_len=10, min_answer_len=10
         if total == 0:
             return True
         alpha_count = sum(1 for c in text if c.isalnum())
+        # If it has a significant number of alphanumeric chars, it's not junk
+        if alpha_count >= absolute_alpha_threshold:
+            continue
         # Mostly non-alphanumeric
         if alpha_count / total < min_alpha_ratio:
             return True
@@ -258,11 +265,11 @@ def generate_qa_from_text(text, model_name="gemma3:12b", source_file="N/A", llm_
         llm_client = LLMClient(provider="ollama")
 
     prompt = f"""
-You are an expert AI dataset creator specializing in technical cybersecurity and IT training data. Based on the following document, generate a list of high-quality Question/Answer pairs for fine-tuning an AI model. Prioritize technical, hands-on questions but also include conceptual questions when the content warrants it.
+You are an expert AI dataset creator specializing in generating high-quality training data. Based on the following document, generate a list of high-quality Question/Answer pairs for fine-tuning an AI model. Prioritize specific, factual, and technical questions but also include conceptual questions when the content warrants it.
 
 CRITICAL RULES:
-1. PRIORITIZE highly technical and specific questions that test real-world, hands-on knowledge. Include concrete details such as tool names, command syntax, protocol specifics, CVE references, configuration parameters, registry keys, API calls, or attack technique names when available.
-2. Conceptual questions are acceptable but should remain specific and non-trivial. Avoid overly generic questions like "What is cybersecurity?" or "Why is security important?".
+1. PRIORITIZE highly specific, detailed, and factual questions that test real-world knowledge or technical details. Include concrete details such as names, command syntax, protocol specifics, tools, values, formulas, configuration parameters, registry keys, API calls, or technique names when available in the text.
+2. Conceptual questions are acceptable but should remain specific and non-trivial. Avoid overly generic questions like "What is this about?" or "Why is this important?".
 3. Answers must be self-contained, precise, and technically accurate. Include specific values, commands, paths, or configurations when relevant.
 4. Keep answers in plain text. Do NOT include code blocks, markdown formatting, or newlines inside answers.
 5. NEVER reference the source document, book, author, chapter, or publication. Write questions and answers as standalone technical knowledge.
@@ -309,17 +316,12 @@ Document text:
 # Regex patterns that detect references to source books/documents/authors
 _SOURCE_REF_PATTERNS = re.compile(
     r'(?:'
-    r'(?:the|this|that|a)\s+(?:book|document|text|article|paper|publication|manual|guide|handbook|report|chapter|module|section|course|training|material|slide|presentation|lecture|reference)'
-    r'|(?:according\s+to|as\s+(?:described|explained|stated|mentioned|discussed|noted|outlined|covered|presented|defined|highlighted)\s+(?:in|by))'
-    r'|(?:the\s+author(?:s)?\s+(?:describe|explain|state|mention|discuss|note|outline|present|define|highlight|argue|suggest|recommend|emphasize|propose))'
-    r'|\bthe\s+book\s+\*'
-    r'|\*[A-Z][^*]{3,60}\*'  # catches *Book Title* in italics
-    r'|(?:in\s+chapter\s+\d)'
-    r'|(?:in\s+module\s+\d)'
-    r'|(?:in\s+section\s+\d)'
-    r'|(?:target\s+audience(?:s)?\s+(?:for|of)\s+the)'
-    r'|(?:what\s+(?:does|do|did)\s+the\s+(?:book|document|text|author|manual|guide|chapter|module))'
-    r'|(?:how\s+does\s+the\s+(?:book|document|text|author|manual|guide|chapter|module))'
+    r'\b(?:this|the)\s+(?:book|document|text|chapter|module|section|manual|guide|handbook|course|material|presentation|lecture)\b'
+    r'|according\s+to\s+(?:the|this)\s+(?:book|document|text|chapter|author|manual|guide)'
+    r'|as\s+(?:described|explained|stated|mentioned|discussed|noted|outlined|covered|presented|defined|highlighted)\s+in\s+(?:the|this)\s+(?:book|document|text|chapter|manual|guide)'
+    r'|\bthe\s+author\s+says\b'
+    r'|\bin\s+(?:chapter|module|section)\s+\d\b'
+    r'|\btarget\s+audience\b'
     r')',
     re.IGNORECASE
 )
