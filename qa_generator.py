@@ -638,6 +638,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
 
                 if file_count == 0 and chunk_errors == 0:
                     failed_files += 1
+                    log_error(input_path, "No valid Q&A pairs extracted.")
                     tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
                 elif file_count > 0:
                     msg = f"  [{filename}] +{file_count} pairs saved"
