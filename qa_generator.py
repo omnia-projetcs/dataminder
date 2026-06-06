@@ -76,6 +76,37 @@ def _is_junk_chunk(text, min_alpha_ratio=0.30, min_alpha_chars=40):
         return True
     return False
 
+
+def _is_junk_qa(qa, min_alpha_ratio=0.40, min_question_len=10, min_answer_len=10):
+    """Return True if a Q&A pair contains junk/garbage content.
+
+    Detects:
+    - Questions or answers that are mostly punctuation/whitespace
+    - Very short or empty questions/answers
+    - Repetitive character patterns (OCR artifacts like '........' or '* * * *')
+    """
+    q = qa.get("question", "").strip()
+    a = qa.get("answer", "").strip()
+
+    # Too short to be useful
+    if len(q) < min_question_len or len(a) < min_answer_len:
+        return True
+
+    for text in (q, a):
+        total = len(text)
+        if total == 0:
+            return True
+        alpha_count = sum(1 for c in text if c.isalnum())
+        # Mostly non-alphanumeric
+        if alpha_count / total < min_alpha_ratio:
+            return True
+        # Repetitive single-character pattern (e.g. "............", "* * * * *")
+        unique_chars = set(text.replace(" ", ""))
+        if len(unique_chars) <= 3 and total > 20:
+            return True
+
+    return False
+
 def log_error(filepath, error_msg):
     _log_error(filepath, error_msg, category="QA GENERATION")
 
@@ -643,7 +674,14 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     filtered_refs = len(all_qa_pairs) - len(clean_pairs)
     if filtered_refs:
         print(f"  Removed {filtered_refs} pairs referencing source material.")
-    
+
+    # Phase 2b: Filter out junk Q&A pairs (garbage content from OCR artifacts)
+    before_junk = len(clean_pairs)
+    clean_pairs = [qa for qa in clean_pairs if not _is_junk_qa(qa)]
+    filtered_junk = before_junk - len(clean_pairs)
+    if filtered_junk:
+        print(f"  Removed {filtered_junk} junk pairs (garbage/punctuation content).")
+
     # Phase 3: Deduplication
     print(f"Phase 3: Removing duplicates from {len(clean_pairs)} pairs (similarity threshold 85%)...")
     unique_qa_pairs = deduplicate_qa(clean_pairs, threshold=0.85)
