@@ -150,6 +150,60 @@ def _try_parse_json(content):
     return pairs if pairs else None
 
 
+def _try_parse_enrichment_json(content):
+    """Try multiple strategies to extract a JSON object with 'input' and 'output' keys from LLM output."""
+
+    def _attempt_parse(json_str):
+        """Try parsing with sanitization and invalid-escape recovery."""
+        # First try with sanitization
+        sanitized = _sanitize_json_string(json_str)
+        try:
+            return json.loads(sanitized)
+        except json.JSONDecodeError:
+            pass
+        # Fallback: strip invalid backslash escapes (e.g. \S, \x without valid hex, etc.)
+        cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', sanitized)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+        return None
+
+    # Strategy 1: Extract JSON from markdown code block ```json ... ```
+    code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+    if code_block_match:
+        result = _attempt_parse(code_block_match.group(1))
+        if isinstance(result, dict):
+            return result
+
+    # Strategy 2: Find outermost { ... } with balanced brace matching
+    start = content.find('{')
+    if start != -1:
+        depth = 0
+        end = start
+        for i in range(start, len(content)):
+            if content[i] == '{':
+                depth += 1
+            elif content[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end > start:
+            result = _attempt_parse(content[start:end])
+            if isinstance(result, dict):
+                return result
+
+    # Strategy 3: Simple first-{-to-last-} extraction (fallback for nested issues)
+    last = content.rfind('}')
+    if start != -1 and last >= start:
+        result = _attempt_parse(content[start:last + 1])
+        if isinstance(result, dict):
+            return result
+
+    return None
+
+
 def generate_qa_from_text(text, model_name="gemma3:12b", source_file="N/A", llm_client=None):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
@@ -685,21 +739,21 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:12b", llm_client=
                 ],
                 keep_alive=-1
             )
-            start, end = content.find('{'), content.rfind('}') + 1
-            if start != -1 and end > start:
-                result = json.loads(content[start:end])
-                if "input" in result and "output" in result:
-                    qa_list[idx] = {
-                        "instruction": inst,
-                        "input": result["input"],
-                        "output": result["output"],
-                        "_meta": {"enriched": True, "model": model_name}
-                    }
-                    enriched_count += 1
-                    # Save incrementally to support resume on crash
-                    if output_path:
-                        with open(output_path, 'w', encoding='utf-8') as f_save:
-                            json.dump(qa_list, f_save, ensure_ascii=False, indent=2)
+            result = _try_parse_enrichment_json(content)
+            if result and "input" in result and "output" in result:
+                qa_list[idx] = {
+                    "instruction": inst,
+                    "input": result["input"],
+                    "output": result["output"] if isinstance(result["output"], str) else json.dumps(result["output"], ensure_ascii=False),
+                    "_meta": {"enriched": True, "model": model_name}
+                }
+                enriched_count += 1
+                # Save incrementally to support resume on crash
+                if output_path:
+                    with open(output_path, 'w', encoding='utf-8') as f_save:
+                        json.dump(qa_list, f_save, ensure_ascii=False, indent=2)
+            else:
+                tqdm.write(f"  [SKIP] [{idx}] Could not parse enrichment JSON from LLM response.")
         except Exception as e:
             tqdm.write(f"  [FAIL] [{idx}] Error: {e}")
         time.sleep(0.2)
