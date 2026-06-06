@@ -557,6 +557,9 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                 file_count = 0
                 filtered_count = 0
                 chunk_errors = 0
+                junk_chunks = 0
+                processed_chunks = 0
+                already_done_count = 0
 
                 def _flush_chunk_pairs(chunk_pairs, chunk_idx):
                     """Write Q&A pairs from one chunk to disk immediately."""
@@ -584,9 +587,13 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                     futures = {}
                     with ThreadPoolExecutor(max_workers=num_threads) as executor:
                         for chunk_idx, chunk in enumerate(chunks):
-                            if not chunk or chunk_idx in done_chunks:
+                            if not chunk:
+                                continue
+                            if chunk_idx in done_chunks:
+                                already_done_count += 1
                                 continue
                             if _is_junk_chunk(chunk):
+                                junk_chunks += 1
                                 continue
                             future = executor.submit(
                                 generate_qa_from_text, chunk,
@@ -600,6 +607,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                         for future in as_completed(futures):
                             chunk_idx = futures[future]
                             completed += 1
+                            processed_chunks += 1
                             pbar.set_postfix({"file": filename[:20], "chunk": f"{completed}/{len(futures)}", "q_saved": total_saved})
                             try:
                                 chunk_pairs = future.result()
@@ -621,12 +629,15 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                         if not chunk:
                             continue
                         if chunk_idx in done_chunks:
+                            already_done_count += 1
                             continue
                         if _is_junk_chunk(chunk):
+                            junk_chunks += 1
                             continue
                         if len(chunks) > 1:
                             pbar.set_postfix({"file": filename[:20], "chunk": f"{chunk_idx+1}/{len(chunks)}", "q_saved": total_saved})
                         
+                        processed_chunks += 1
                         try:
                             chunk_pairs = generate_qa_from_text(chunk, model_name=model_name, source_file=input_path, llm_client=llm_client)
                             _flush_chunk_pairs(chunk_pairs, chunk_idx)
@@ -636,7 +647,24 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                             tqdm.write(f"  [{filename}] chunk {chunk_idx} error: {e}")
                             continue
 
-                if file_count == 0 and chunk_errors == 0:
+                # End-of-file reporting and sentinel logic
+                if processed_chunks == 0 and file_count == 0:
+                    if already_done_count > 0 and junk_chunks == 0:
+                        # All chunks were already processed on a previous run — write sentinel silently
+                        with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
+                            sentinel = {"_source_file": filename, "_chunk_idx": -1, "_skipped": False}
+                            f_raw.write(json.dumps(sentinel, ensure_ascii=False) + "\n")
+                    else:
+                        # No chunks sent to LLM (all junk/empty) — mark as skipped
+                        with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
+                            sentinel = {"_source_file": filename, "_chunk_idx": -1, "_skipped": True}
+                            f_raw.write(json.dumps(sentinel, ensure_ascii=False) + "\n")
+                        if junk_chunks > 0:
+                            tqdm.write(f"  [{filename}] Skipped — all {junk_chunks} chunks are junk/garbage.")
+                            log_error(input_path, f"Skipped — all {junk_chunks} chunks are junk/garbage content.")
+                        else:
+                            tqdm.write(f"  [{filename}] Skipped — no processable chunks.")
+                elif file_count == 0 and chunk_errors == 0:
                     failed_files += 1
                     log_error(input_path, "No valid Q&A pairs extracted.")
                     tqdm.write(f"  [{filename}] No valid Q&A pairs extracted.")
