@@ -592,6 +592,8 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     if os.path.exists(raw_jsonl_path):
         with open(raw_jsonl_path, 'r', encoding='utf-8') as f:
             total_saved = sum(1 for line in f if line.strip())
+
+    total_saved_before = total_saved  # snapshot to detect new pairs added by Phase 1
         
     if files_to_process:
         print(f"Processing {len(files_to_process)} Markdown files for Q&A generation...")
@@ -751,8 +753,39 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                 continue
 
         print(f"\nPhase 1 Complete. {total_saved} total raw Q&A pairs on disk ({failed_files} files had issues).")
+        new_pairs_count = total_saved - total_saved_before
     else:
+        new_pairs_count = 0
         print("All files already processed. Skipping to deduplication.")
+
+    # Fast-path: if Phase 1 added no new pairs and the final dataset already exists,
+    # skip the expensive phases 2-4 (filter + dedup + save) entirely.
+    dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
+    dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
+
+    if new_pairs_count == 0 and os.path.exists(dataset_json_path) and os.path.exists(dataset_md_path):
+        print(f"\nNo new Q&A pairs generated. Final dataset already exists — skipping phases 2-4.")
+        # Jump directly to enrichment (Phase 5) if requested
+        if enrich and enrich_ratio > 0:
+            try:
+                with open(dataset_json_path, 'r', encoding='utf-8') as f_json:
+                    alpaca_format = json.load(f_json)
+                print(f"Loaded {len(alpaca_format)} entries from existing dataset for enrichment.")
+                dataset_enriched_path = os.path.join(dest_dir, "dataset_qa_enriched.json")
+                enriched_pairs = _enrich_after_dedup(list(alpaca_format), ratio=enrich_ratio, model_name=model_name, llm_client=llm_client, output_path=dataset_enriched_path)
+                with open(dataset_enriched_path, 'w', encoding='utf-8') as f_enriched:
+                    json.dump(enriched_pairs, f_enriched, ensure_ascii=False, indent=2)
+                enriched_count = sum(1 for e in enriched_pairs if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
+                print(f"Saved enriched dataset ({enriched_count} entries enriched) to: {dataset_enriched_path}")
+            except (json.JSONDecodeError, Exception) as e:
+                print(f"  [WARNING] Could not load existing dataset for enrichment: {e}")
+                print("  Falling through to full phases 2-4...")
+            else:
+                llm_client.unload_model(model_name)
+                return
+        else:
+            llm_client.unload_model(model_name)
+            return
     
     # Load all raw pairs from disk for deduplication
     all_qa_pairs = _load_raw_pairs(raw_jsonl_path)
@@ -779,9 +812,6 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     # Phase 3: Deduplication
     print(f"Phase 3: Removing duplicates from {len(clean_pairs)} pairs (similarity threshold 85%)...")
     unique_qa_pairs = deduplicate_qa(clean_pairs, threshold=0.85)
-    
-    dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
-    dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
     
     print("Phase 4: Saving final clean files...")
     
