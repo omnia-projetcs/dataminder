@@ -57,7 +57,7 @@ dataminder/
 - Linux (Ubuntu/Debian) or macOS
 - Python 3.8+
 - [Ollama](https://ollama.com/) installed and running locally.
-- An Ollama model downloaded (e.g., `gemma3:4b-it-q4_K_M`, `mistral`). To download a model, run in your terminal: `ollama pull gemma3:4b-it-q4_K_M`.
+- An Ollama model downloaded (e.g., `gemma3:4b-it-q4_K_M`, `gemma3:12b`, `mistral`). To download a model, run in your terminal: `ollama pull gemma3:4b-it-q4_K_M`.
 
 ## Installation
 
