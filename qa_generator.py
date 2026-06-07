@@ -218,44 +218,107 @@ def _try_parse_enrichment_json(content):
         except json.JSONDecodeError:
             pass
         # Fallback: strip invalid backslash escapes (e.g. \S, \x without valid hex, etc.)
-        cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', sanitized)
+        cleaned = re.sub(r'\\(?!["\\\\bfnrtu])', r'\\\\', sanitized)
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
+        # Fallback 2: aggressively strip ALL backslash sequences that aren't standard JSON escapes
+        aggressive = re.sub(r'\\(?!["\\\\bfnrtu/])', '', sanitized)
+        try:
+            return json.loads(aggressive)
+        except json.JSONDecodeError:
+            pass
         return None
 
-    # Strategy 1: Extract JSON from markdown code block ```json ... ```
-    code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+    def _validate_enrichment(result):
+        """Check that a parsed dict has usable 'input' and 'output' keys."""
+        if not isinstance(result, dict):
+            return None
+        if "input" in result and "output" in result:
+            return result
+        # Sometimes the LLM nests the data one level deep (e.g. {"result": {"input": ..., "output": ...}})
+        for v in result.values():
+            if isinstance(v, dict) and "input" in v and "output" in v:
+                return v
+        return None
+
+    # Strategy 1: Extract JSON from markdown code block ```json ... ``` (non-greedy for inner braces)
+    code_block_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', content, re.DOTALL)
     if code_block_match:
         result = _attempt_parse(code_block_match.group(1))
-        if isinstance(result, dict):
-            return result
+        validated = _validate_enrichment(result)
+        if validated:
+            return validated
 
-    # Strategy 2: Find outermost { ... } with balanced brace matching
+    # Strategy 2: Find outermost { ... } with balanced brace matching (skip braces inside strings)
     start = content.find('{')
     if start != -1:
         depth = 0
         end = start
-        for i in range(start, len(content)):
-            if content[i] == '{':
-                depth += 1
-            elif content[i] == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
+        in_str = False
+        i = start
+        while i < len(content):
+            ch = content[i]
+            if ch == '\\' and in_str:
+                i += 2  # skip escaped char
+                continue
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            i += 1
         if end > start:
             result = _attempt_parse(content[start:end])
-            if isinstance(result, dict):
-                return result
+            validated = _validate_enrichment(result)
+            if validated:
+                return validated
 
     # Strategy 3: Simple first-{-to-last-} extraction (fallback for nested issues)
     last = content.rfind('}')
     if start != -1 and last >= start:
         result = _attempt_parse(content[start:last + 1])
-        if isinstance(result, dict):
-            return result
+        validated = _validate_enrichment(result)
+        if validated:
+            return validated
+
+    # Strategy 4: Regex extraction of individual fields when JSON structure is broken
+    # Try to find "input" and "output" values even if the overall JSON is malformed
+    input_match = re.search(r'"input"\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.DOTALL)
+    output_match = re.search(r'"output"\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.DOTALL)
+    if input_match and output_match:
+        try:
+            inp = input_match.group(1).replace('\\n', '\n').replace('\\t', ' ')
+            out = output_match.group(1).replace('\\n', '\n').replace('\\t', ' ')
+            if inp.strip() and out.strip():
+                return {"input": inp, "output": out}
+        except Exception:
+            pass
+
+    # Strategy 5: "output" might be a nested JSON object rather than a string
+    if input_match:
+        output_obj_match = re.search(r'"output"\s*:\s*(\{.*)', content, re.DOTALL)
+        if output_obj_match:
+            obj_str = output_obj_match.group(1)
+            # Find balanced braces
+            depth = 0
+            for i, ch in enumerate(obj_str):
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        result = _attempt_parse(obj_str[:i+1])
+                        if isinstance(result, dict):
+                            inp = input_match.group(1).replace('\\n', '\n').replace('\\t', ' ')
+                            return {"input": inp, "output": result}
+                        break
 
     return None
 
@@ -844,7 +907,8 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
                     with open(output_path, 'w', encoding='utf-8') as f_save:
                         json.dump(qa_list, f_save, ensure_ascii=False, indent=2)
             else:
-                tqdm.write(f"  [SKIP] [{idx}] Could not parse enrichment JSON from LLM response.")
+                preview = content[:300].replace('\n', ' ') if content else '<empty>'
+                tqdm.write(f"  [SKIP] [{idx}] Could not parse enrichment JSON from LLM response. Preview: {preview}")
         except Exception as e:
             tqdm.write(f"  [FAIL] [{idx}] Error: {e}")
         time.sleep(0.2)
