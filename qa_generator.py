@@ -231,6 +231,42 @@ def _try_parse_enrichment_json(content):
             pass
         return None
 
+    def _attempt_parse_truncated(json_str):
+        """Try to repair and parse truncated JSON by closing open structures."""
+        # Try the normal parse first
+        result = _attempt_parse(json_str)
+        if result is not None:
+            return result
+
+        # Attempt to close truncated JSON: track open braces/brackets/strings
+        sanitized = _sanitize_json_string(json_str)
+        # Strip trailing incomplete string values (e.g. cut mid-sentence)
+        # Try progressively trimming from the end to find a parseable prefix
+        for trim_target in ['\n', '.', ',', ' ']:
+            last_pos = sanitized.rfind(trim_target)
+            while last_pos > len(sanitized) // 2:
+                candidate = sanitized[:last_pos]
+                # Close any open string
+                if candidate.count('"') % 2 != 0:
+                    candidate += '"'
+                # Close open braces/brackets
+                open_braces = candidate.count('{') - candidate.count('}')
+                open_brackets = candidate.count('[') - candidate.count(']')
+                candidate += ']' * max(0, open_brackets)
+                candidate += '}' * max(0, open_braces)
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+                # Also try with aggressive escape stripping
+                aggressive = re.sub(r'\\(?!["\\\\bfnrtu/])', '', candidate)
+                try:
+                    return json.loads(aggressive)
+                except json.JSONDecodeError:
+                    pass
+                last_pos = sanitized.rfind(trim_target, 0, last_pos)
+        return None
+
     def _validate_enrichment(result):
         """Check that a parsed dict has usable 'input' and 'output' keys."""
         if not isinstance(result, dict):
@@ -247,6 +283,20 @@ def _try_parse_enrichment_json(content):
     code_block_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', content, re.DOTALL)
     if code_block_match:
         result = _attempt_parse(code_block_match.group(1))
+        validated = _validate_enrichment(result)
+        if validated:
+            return validated
+
+    # Strategy 1b: Strip opening ```json fence when closing ``` is missing (truncated response)
+    fence_open_match = re.search(r'```(?:json)?\s*(\{.*)', content, re.DOTALL)
+    if fence_open_match:
+        stripped = fence_open_match.group(1).rstrip('`').rstrip()
+        result = _attempt_parse(stripped)
+        validated = _validate_enrichment(result)
+        if validated:
+            return validated
+        # Try truncated repair on the fence-stripped content
+        result = _attempt_parse_truncated(stripped)
         validated = _validate_enrichment(result)
         if validated:
             return validated
@@ -319,6 +369,71 @@ def _try_parse_enrichment_json(content):
                             inp = input_match.group(1).replace('\\n', '\n').replace('\\t', ' ')
                             return {"input": inp, "output": result}
                         break
+
+    # Strategy 6: "input" is a nested JSON object (not a string), "output" may also be nested
+    input_obj_match = re.search(r'"input"\s*:\s*(\{)', content, re.DOTALL)
+    if input_obj_match:
+        # Extract balanced input object
+        obj_start = input_obj_match.start(1)
+        depth = 0
+        in_s = False
+        inp_end = obj_start
+        j = obj_start
+        while j < len(content):
+            ch = content[j]
+            if ch == '\\' and in_s:
+                j += 2
+                continue
+            if ch == '"':
+                in_s = not in_s
+            elif not in_s:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        inp_end = j + 1
+                        break
+            j += 1
+        if inp_end > obj_start:
+            inp_result = _attempt_parse(content[obj_start:inp_end])
+            if isinstance(inp_result, dict):
+                # Now find "output" after input
+                remainder = content[inp_end:]
+                out_obj_match = re.search(r'"output"\s*:\s*(\{)', remainder, re.DOTALL)
+                if out_obj_match:
+                    out_start = out_obj_match.start(1)
+                    depth = 0
+                    in_s = False
+                    out_end = out_start
+                    k = out_start
+                    while k < len(remainder):
+                        ch = remainder[k]
+                        if ch == '\\' and in_s:
+                            k += 2
+                            continue
+                        if ch == '"':
+                            in_s = not in_s
+                        elif not in_s:
+                            if ch == '{':
+                                depth += 1
+                            elif ch == '}':
+                                depth -= 1
+                                if depth == 0:
+                                    out_end = k + 1
+                                    break
+                        k += 1
+                    if out_end > out_start:
+                        out_result = _attempt_parse(remainder[out_start:out_end])
+                        if out_result is not None:
+                            return {"input": inp_result, "output": out_result}
+
+    # Strategy 7: Last resort — truncated JSON repair on the full content from first {
+    if start != -1:
+        result = _attempt_parse_truncated(content[start:])
+        validated = _validate_enrichment(result)
+        if validated:
+            return validated
 
     return None
 
