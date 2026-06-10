@@ -698,9 +698,12 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     
     if not force and len(files_to_process) == 0:
         if os.path.exists(dataset_json_path) and os.path.exists(dataset_md_path):
-            print("Resuming: Q&A dataset is already complete and all files have been processed. Skipping completely.")
-            llm_client.unload_model(model_name)
-            return
+            if enrich and enrich_ratio > 0:
+                print("Resuming: Q&A dataset is already complete and all files have been processed. Jumping directly to enrichment (Phase 5).")
+            else:
+                print("Resuming: Q&A dataset is already complete and all files have been processed. Skipping completely.")
+                llm_client.unload_model(model_name)
+                return
     
     # Count existing pairs without loading them all into memory
     total_saved = 0
