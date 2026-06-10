@@ -973,7 +973,8 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
     Ollama and vLLM providers.
 
     Resume support: if output_path exists, loads it and skips entries
-    already enriched. Saves incrementally after each successful enrichment.
+    already enriched. Saves incrementally (periodically and atomically) 
+    to support resume on crash.
     """
     if ratio <= 0 or not qa_list:
         return qa_list
@@ -982,31 +983,41 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
         llm_client = LLMClient(provider="ollama")
 
     # Resume: load existing enriched data if available
+    already_enriched_count = 0
     if output_path and os.path.exists(output_path):
         try:
             with open(output_path, 'r', encoding='utf-8') as f:
                 existing = json.load(f)
             if isinstance(existing, list) and len(existing) == len(qa_list):
                 # Restore already-enriched entries
-                already_done = 0
                 for i, entry in enumerate(existing):
-                    if isinstance(entry.get("_meta"), dict) and entry["_meta"].get("enriched"):
+                    if isinstance(entry, dict) and isinstance(entry.get("_meta"), dict) and entry["_meta"].get("enriched"):
                         qa_list[i] = entry
-                        already_done += 1
-                if already_done > 0:
-                    print(f"  Resuming enrichment: {already_done} entries already enriched.")
+                        already_enriched_count += 1
+                if already_enriched_count > 0:
+                    print(f"  Resuming enrichment: {already_enriched_count} entries already enriched.")
         except (json.JSONDecodeError, Exception) as e:
             print(f"  [WARNING] Could not load existing enriched file for resume: {e}")
 
+    # Determine targets and indices
     n_to_enrich = max(1, int(len(qa_list) * ratio))
-    indices = random.sample(range(len(qa_list)), min(n_to_enrich, len(qa_list)))
+    target_new_to_enrich = n_to_enrich - already_enriched_count
 
-    # Filter out indices that are already enriched (resume support)
-    indices = [i for i in indices if not (isinstance(qa_list[i].get("_meta"), dict) and qa_list[i]["_meta"].get("enriched"))]
+    if target_new_to_enrich <= 0:
+        print(f"\nPhase 5: All {already_enriched_count} target entries already enriched (target ratio {ratio*100:.0f}% met). Skipping.")
+        return qa_list
+
+    # Find all indices that are NOT yet enriched
+    non_enriched_indices = [
+        i for i, entry in enumerate(qa_list)
+        if not (isinstance(entry, dict) and isinstance(entry.get("_meta"), dict) and entry["_meta"].get("enriched"))
+    ]
+
+    # Sample exactly what is needed to reach the target ratio
+    indices = random.sample(non_enriched_indices, min(target_new_to_enrich, len(non_enriched_indices)))
 
     if not indices:
-        enriched_total = sum(1 for e in qa_list if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
-        print(f"\nPhase 5: All {enriched_total} target entries already enriched. Skipping.")
+        print(f"\nPhase 5: No more entries available to enrich. Skipping.")
         return qa_list
 
     system_prompt = (
@@ -1017,47 +1028,65 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
         "No markdown, no explanation, no code fences — just the raw JSON object."
     )
 
-    already_enriched = sum(1 for e in qa_list if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
-    total_target = already_enriched + len(indices)
+    total_target = already_enriched_count + len(indices)
     print(f"\nPhase 5: Post-deduplication enrichment: {len(indices)} remaining / {total_target} target ({ratio*100:.0f}%)...")
 
     enriched_count = 0
-    for idx in tqdm(indices, desc="Enriching", unit="entry"):
-        entry = qa_list[idx]
-        inst = entry.get("instruction", entry.get("question", ""))
-        ans = entry.get("output", entry.get("answer", ""))
-        if not inst or not ans:
-            continue
+    
+    def _save_progress():
+        if output_path:
+            temp_output_path = output_path + ".tmp"
+            try:
+                # Write to temp file first then atomically replace to avoid corruption
+                with open(temp_output_path, 'w', encoding='utf-8') as f_save:
+                    json.dump(qa_list, f_save, ensure_ascii=False, indent=2)
+                os.replace(temp_output_path, output_path)
+            except Exception as save_err:
+                tqdm.write(f"  [WARNING] Failed to save progress: {save_err}")
 
-        try:
-            content = llm_client.chat(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Question: {inst}\nAnswer: {ans}\n\nGenerate enriched input/output."}
-                ],
-                keep_alive=-1
-            )
-            result = _try_parse_enrichment_json(content)
-            if result and "input" in result and "output" in result:
-                qa_list[idx] = {
-                    "instruction": inst,
-                    "input": result["input"],
-                    "output": result["output"] if isinstance(result["output"], str) else json.dumps(result["output"], ensure_ascii=False),
-                    "_meta": {"enriched": True, "model": model_name}
-                }
-                enriched_count += 1
-                # Save incrementally to support resume on crash
-                if output_path:
-                    with open(output_path, 'w', encoding='utf-8') as f_save:
-                        json.dump(qa_list, f_save, ensure_ascii=False, indent=2)
-            else:
-                preview = content[:300].replace('\n', ' ') if content else '<empty>'
-                tqdm.write(f"  [SKIP] [{idx}] Could not parse enrichment JSON from LLM response. Preview: {preview}")
-        except Exception as e:
-            tqdm.write(f"  [FAIL] [{idx}] Error: {e}")
-        time.sleep(0.2)
+    try:
+        for idx in tqdm(indices, desc="Enriching", unit="entry"):
+            entry = qa_list[idx]
+            if not isinstance(entry, dict):
+                continue
+            inst = entry.get("instruction", entry.get("question", ""))
+            ans = entry.get("output", entry.get("answer", ""))
+            if not inst or not ans:
+                continue
 
-    final_total = sum(1 for e in qa_list if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
-    print(f"  Enrichment complete. {enriched_count} new + {already_enriched} resumed = {final_total} total enriched.\n")
+            try:
+                content = llm_client.chat(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Question: {inst}\nAnswer: {ans}\n\nGenerate enriched input/output."}
+                    ],
+                    keep_alive=-1
+                )
+                result = _try_parse_enrichment_json(content)
+                if result and "input" in result and "output" in result:
+                    qa_list[idx] = {
+                        "instruction": inst,
+                        "input": result["input"],
+                        "output": result["output"] if isinstance(result["output"], str) else json.dumps(result["output"], ensure_ascii=False),
+                        "_meta": {"enriched": True, "model": model_name}
+                    }
+                    enriched_count += 1
+                    
+                    # Save periodically (every 50 successful enrichments) to avoid excessive disk/CPU thrashing
+                    if enriched_count % 50 == 0:
+                        _save_progress()
+                else:
+                    preview = content[:300].replace('\n', ' ') if content else '<empty>'
+                    tqdm.write(f"  [SKIP] [{idx}] Could not parse enrichment JSON from LLM response. Preview: {preview}")
+            except Exception as e:
+                tqdm.write(f"  [FAIL] [{idx}] Error: {e}")
+            time.sleep(0.2)
+    finally:
+        # Final save on exit/interruption to ensure no progress is lost
+        if enriched_count > 0:
+            _save_progress()
+
+    final_total = sum(1 for e in qa_list if isinstance(e, dict) and isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
+    print(f"  Enrichment complete. {enriched_count} new + {already_enriched_count} resumed = {final_total} total enriched.\n")
     return qa_list
