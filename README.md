@@ -250,7 +250,7 @@ python main.py --provider vllm --vllm-url http://my-server:8000 --vllm-key sk-my
 
 ### Multithreading (Parallel Chunk Processing)
 
-When using a remote vLLM server that can handle concurrent requests, you can speed up processing by using multiple threads. Each chunk of a document will be sent in parallel:
+When using an LLM server that can handle concurrent requests, you can speed up processing by using multiple threads. Each chunk of a document will be sent in parallel. The LLM client reuses thread-local HTTP sessions so model workers avoid reconnecting for every chunk:
 
 ```bash
 # Process chunks with 4 threads
@@ -263,7 +263,7 @@ python main.py --full --provider vllm --vllm-url http://my-server:8000 --model m
 python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-model --threads 4
 ```
 
-> **Note:** Multithreading is mainly beneficial with remote servers that handle concurrent requests. When using Ollama locally, requests are serialized by the server, so `--threads > 1` won't improve speed.
+> **Note:** Multithreading is most beneficial with servers that handle concurrent requests (for example, vLLM or an Ollama setup configured for parallel model work). If your local Ollama server serializes requests, `--threads > 1` may not improve throughput.
 
 ### All CLI Options
 
@@ -276,6 +276,7 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 | `--provider` | `ollama` | LLM provider: `ollama` or `vllm` |
 | `--vllm-url` | `http://localhost:8000` | vLLM server URL |
 | `--vllm-key` | *(empty)* | API key for vLLM (optional) |
+| `--ollama-url` | `OLLAMA_HOST` or `http://localhost:11434` | Ollama server URL (Ollama provider only) |
 | `--threads` | *(off)* | Enable parallel chunk processing (default: 5 threads if activated, e.g. `--threads` or `--threads 8`) |
 | `--enrich-ratio` | `0.3` | Fraction of deduplicated pairs to enrich (0 = skip, 1.0 = all). Used with `--full` or `--enrich` |
 | `--ocr-engine` | `tesseract` | OCR engine: `tesseract` (legacy, default) or `paddleocr` (PP-OCRv5, deep learning) |

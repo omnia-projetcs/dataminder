@@ -189,6 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--provider", default="ollama", choices=["ollama", "vllm"], help="LLM provider to use: 'ollama' (local, default) or 'vllm' (remote OpenAI-compatible server).")
     parser.add_argument("--vllm-url", default="http://localhost:8000", help="vLLM server URL (default: http://localhost:8000). Only used when --provider=vllm.")
     parser.add_argument("--vllm-key", default="", help="API key for the vLLM server (optional). Only used when --provider=vllm.")
+    parser.add_argument("--ollama-url", default=None, help="Ollama server URL (default: OLLAMA_HOST or http://localhost:11434). Only used when --provider=ollama.")
     parser.add_argument('--threads', type=int, nargs='?', const=5, default=None, help="Enable multithreaded chunk processing. Without a value, defaults to 5 threads. You can specify a custom number (e.g. --threads 8). Omit this flag entirely for sequential processing.")
     parser.add_argument('--timeout', type=int, default=300, help="Timeout in seconds for each LLM call (default: 300). The call will be retried up to 3 times with exponential backoff before giving up.")
     
@@ -216,7 +217,8 @@ if __name__ == "__main__":
         provider=args.provider,
         vllm_url=args.vllm_url,
         vllm_api_key=args.vllm_key,
-        timeout=args.timeout
+        timeout=args.timeout,
+        ollama_url=args.ollama_url
     )
     num_threads = args.threads if args.threads else 1
     

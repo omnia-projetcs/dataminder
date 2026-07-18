@@ -6,10 +6,12 @@ Supports two providers:
   - vllm   : Remote vLLM server via OpenAI-compatible API
 """
 
+import os
 import threading
 import time
+
 import requests
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from requests.adapters import HTTPAdapter
 
 
 # Default timeout per LLM call (seconds) and retry settings
@@ -21,11 +23,14 @@ RETRY_BACKOFF_BASE = 5  # seconds — retry delays: 5s, 10s, 20s
 class LLMClient:
     """Thread-safe LLM client that delegates to either Ollama or vLLM."""
 
-    def __init__(self, provider="ollama", vllm_url="http://localhost:8000", vllm_api_key="", timeout=None):
+    def __init__(self, provider="ollama", vllm_url="http://localhost:8000", vllm_api_key="", timeout=None, ollama_url=None, max_pool_connections=32):
         self.provider = provider.lower()
         self.vllm_url = vllm_url.rstrip("/")
         self.vllm_api_key = vllm_api_key
         self.timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
+        self.ollama_url = self._normalize_ollama_url(ollama_url)
+        self.max_pool_connections = max_pool_connections
+        self._thread_local = threading.local()
         self._vllm_endpoint = None  # "chat" or "completions"
         self._vllm_model = None     # auto-detected from /v1/models
         self._detect_lock = threading.Lock()
@@ -57,7 +62,7 @@ class LLMClient:
                     return self._chat_ollama(model, messages, keep_alive)
                 else:
                     return self._chat_vllm(model, messages)
-            except (TimeoutError, FuturesTimeoutError) as e:
+            except (TimeoutError, requests.Timeout) as e:
                 last_error = e
                 if attempt < MAX_RETRIES:
                     delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
@@ -81,36 +86,67 @@ class LLMClient:
         if self.provider != "ollama":
             return
         try:
-            import ollama
-            ollama.chat(model=model, messages=[
-                {'role': 'user', 'content': '.'}
-            ], keep_alive=0)
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": "."}],
+                "keep_alive": 0,
+                "stream": False,
+            }
+            self._session().post(f"{self.ollama_url}/api/chat", json=payload, timeout=30)
         except Exception:
             pass
 
-    def _chat_ollama(self, model, messages, keep_alive):
-        """Call Ollama with a thread-based timeout wrapper.
+    @staticmethod
+    def _normalize_ollama_url(ollama_url):
+        """Return a base Ollama URL without API path suffixes."""
+        base_url = ollama_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/api"):
+            base_url = base_url[:-4]
+        return base_url
 
-        The ollama Python library has no native timeout, so we run the blocking
-        call inside a thread and enforce a deadline via future.result(timeout=...).
+    def _session(self):
+        """Return a thread-local HTTP session with a shared connection-pool size.
+
+        requests.Session is not guaranteed to be thread-safe, so each worker
+        thread gets its own session while still benefiting from HTTP keep-alive
+        and adapter-level connection pooling.
         """
-        import ollama as ollama_lib
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(
+                pool_connections=self.max_pool_connections,
+                pool_maxsize=self.max_pool_connections,
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._thread_local.session = session
+        return session
 
-        def _blocking_call():
-            kwargs = {"model": model, "messages": messages}
-            if keep_alive is not None:
-                kwargs["keep_alive"] = keep_alive
-            response = ollama_lib.chat(**kwargs)
-            return response['message']['content']
+    def _chat_ollama(self, model, messages, keep_alive):
+        """Call Ollama's HTTP API with native request timeouts.
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_blocking_call)
-            try:
-                return future.result(timeout=self.timeout)
-            except FuturesTimeoutError:
-                raise TimeoutError(
-                    f"Ollama chat call exceeded {self.timeout}s timeout"
-                )
+        Using the HTTP API directly avoids spawning a nested one-off executor for
+        every call. This is cheaper under --threads and lets each model worker
+        reuse its thread-local HTTP connection to Ollama.
+        """
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+
+        resp = self._session().post(
+            f"{self.ollama_url}/api/chat",
+            json=payload,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("message", {}).get("content", "")
 
     def _chat_vllm(self, model, messages):
         headers = {"Content-Type": "application/json"}
@@ -138,7 +174,7 @@ class LLMClient:
         """Query /v1/models to auto-detect the loaded model on the vLLM server."""
         url = f"{self.vllm_url}/v1/models"
         try:
-            resp = requests.get(url, headers=headers, timeout=30)
+            resp = self._session().get(url, headers=headers, timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
                 models = data.get("data", [])
@@ -167,7 +203,7 @@ class LLMClient:
         }
 
         try:
-            resp = requests.post(chat_url, json=probe_payload, headers=headers, timeout=30)
+            resp = self._session().post(chat_url, json=probe_payload, headers=headers, timeout=30)
         except requests.RequestException as e:
             print(f"[vLLM] Could not probe /v1/chat/completions ({e}), assuming /v1/completions")
             self._vllm_endpoint = "completions"
@@ -189,7 +225,7 @@ class LLMClient:
             "max_tokens": 8192,
             "temperature": 0.7,
         }
-        resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+        resp = self._session().post(url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -204,7 +240,7 @@ class LLMClient:
             "max_tokens": 8192,
             "temperature": 0.7,
         }
-        resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+        resp = self._session().post(url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["text"]
@@ -227,7 +263,7 @@ class LLMClient:
 
     def __repr__(self):
         if self.provider == "ollama":
-            return f"LLMClient(provider=ollama, timeout={self.timeout}s)"
+            return f"LLMClient(provider=ollama, url={self.ollama_url}, timeout={self.timeout}s)"
         endpoint = self._vllm_endpoint or "auto"
         model = self._vllm_model or "auto"
         return f"LLMClient(provider=vllm, url={self.vllm_url}, endpoint={endpoint}, model={model}, timeout={self.timeout}s)"
