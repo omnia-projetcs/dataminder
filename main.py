@@ -279,6 +279,10 @@ if __name__ == "__main__":
                 json.dump(enriched, f, ensure_ascii=False, indent=2)
             enriched_count = sum(1 for e in enriched if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
             print(f"Saved enriched dataset ({enriched_count}/{len(enriched)} entries) to: {enriched_path}")
+            from qa_generator import clean_dataset, prepare_hf_dataset
+            cleaned_enriched = clean_dataset(enriched_path)
+            if cleaned_enriched:
+                prepare_hf_dataset(cleaned_enriched)
             llm_client.unload_model(args.model)
         print("\n--- Enrichment Complete ---")
     else:

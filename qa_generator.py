@@ -12,6 +12,7 @@ import random
 from llm_client import LLMClient
 from logger import log_error as _log_error
 
+
 CHUNK_SIZE = 5000
 
 # --- Graceful shutdown on SIGTERM / SIGINT ---
@@ -895,6 +896,10 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                     json.dump(enriched_pairs, f_enriched, ensure_ascii=False, indent=2)
                 enriched_count = sum(1 for e in enriched_pairs if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
                 print(f"Saved enriched dataset ({enriched_count} entries enriched) to: {dataset_enriched_path}")
+                clean_dataset(dataset_json_path)
+                cleaned_enriched = clean_dataset(dataset_enriched_path)
+                if cleaned_enriched:
+                    prepare_hf_dataset(cleaned_enriched)
             except (json.JSONDecodeError, Exception) as e:
                 print(f"  [WARNING] Could not load existing dataset for enrichment: {e}")
                 print("  Falling through to full phases 2-4...")
@@ -902,6 +907,9 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                 llm_client.unload_model(model_name)
                 return
         else:
+            cleaned_json = clean_dataset(dataset_json_path)
+            if cleaned_json:
+                prepare_hf_dataset(cleaned_json)
             llm_client.unload_model(model_name)
             return
     
@@ -953,6 +961,9 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     print(f"Saved Markdown readable dataset to: {dataset_md_path}")
     print(f"Raw data preserved in: {raw_jsonl_path}")
 
+    # Clean standard dataset
+    cleaned_json = clean_dataset(dataset_json_path)
+
     # Phase 5: Post-deduplication enrichment (only in full pipeline mode)
     if enrich and enrich_ratio > 0:
         dataset_enriched_path = os.path.join(dest_dir, "dataset_qa_enriched.json")
@@ -962,8 +973,16 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
             json.dump(enriched_pairs, f_enriched, ensure_ascii=False, indent=2)
         enriched_count = sum(1 for e in enriched_pairs if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
         print(f"Saved enriched dataset ({enriched_count} entries enriched) to: {dataset_enriched_path}")
-    elif enrich:
-        print("\nPhase 5: Enrichment skipped (enrich-ratio is 0).")
+        cleaned_enriched = clean_dataset(dataset_enriched_path)
+        if cleaned_enriched:
+            prepare_hf_dataset(cleaned_enriched)
+    else:
+        if cleaned_json:
+            prepare_hf_dataset(cleaned_json)
+        if enrich:
+            print("\nPhase 5: Enrichment skipped (enrich-ratio is 0).")
+
+
 
     # Unload model from VRAM (only for Ollama)
     llm_client.unload_model(model_name)
@@ -1092,4 +1111,122 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
 
     final_total = sum(1 for e in qa_list if isinstance(e, dict) and isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
     print(f"  Enrichment complete. {enriched_count} new + {already_enriched_count} resumed = {final_total} total enriched.\n")
+
+
+def clean_dataset(data_or_filepath, output_file=None):
+    """
+    Lit un fichier JSON ou une liste d'objets (avec instruction, input, output),
+    nettoie et valide les entrées, puis écrit un fichier JSONL (un objet JSON par ligne).
+    """
+    data = None
+    input_desc = ""
+
+    if isinstance(data_or_filepath, str):
+        input_file = data_or_filepath
+        if not os.path.exists(input_file):
+            print(f"⚠️ Fichier introuvable pour le nettoyage : {input_file}")
+            return None
+        input_desc = input_file
+        if output_file is None:
+            if input_file.endswith(".json"):
+                output_file = input_file[:-5] + "_cleaned.json"
+            else:
+                output_file = f"{input_file}_cleaned.json"
+        try:
+            with open(input_file, "r", encoding="utf-8") as infile:
+                data = json.load(infile)
+        except Exception as e:
+            print(f"❌ Erreur lors de la lecture de '{input_file}': {e}")
+            return None
+    elif isinstance(data_or_filepath, list):
+        data = data_or_filepath
+        input_desc = "liste en mémoire"
+        if output_file is None:
+            output_file = "dataset_cleaned.json"
+    else:
+        print(f"⚠️ Type de données invalide pour clean_dataset: {type(data_or_filepath)}")
+        return None
+
+    if not isinstance(data, list):
+        print(f"⚠️ Format inattendu dans '{input_desc}': attendu une liste JSON.")
+        return None
+
+    valides = 0
+    print(f"Nettoyage du jeu de données '{input_desc}' -> '{output_file}'...")
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as outfile:
+            for item in data:
+                if isinstance(item, dict):
+                    instruction = str(item.get("instruction") or "").strip()
+                    output = str(item.get("output") or "").strip()
+                    input_val = str(item.get("input") or "").strip()
+
+                    if instruction and output:
+                        clean_entry = {
+                            "instruction": instruction,
+                            "input": input_val,
+                            "output": output
+                        }
+                        outfile.write(json.dumps(clean_entry, ensure_ascii=False) + "\n")
+                        valides += 1
+
+        print(f"✅ Terminé ! {valides} lignes valides enregistrées dans '{output_file}'")
+        return output_file
+    except Exception as e:
+        print(f"❌ Erreur lors du nettoyage de '{input_desc}': {e}")
+        return None
+
+
+def prepare_hf_dataset(input_file, output_file=None):
+    """
+    Transforme un fichier de jeu de données nettoyé (JSONL avec instruction, input, output)
+    en un fichier au format Hugging Face AutoTrain / fine-tuning (JSONL avec clé "text").
+    """
+    if not os.path.exists(input_file):
+        print(f"⚠️ Fichier introuvable pour la préparation HF : {input_file}")
+        return None
+
+    if output_file is None:
+        if input_file.endswith(".json") or input_file.endswith(".jsonl"):
+            base = os.path.splitext(input_file)[0]
+            output_file = f"{base}_hf.jsonl"
+        else:
+            output_file = f"{input_file}_hf.jsonl"
+
+    count = 0
+    print(f"Préparation de l'export Hugging Face '{input_file}' -> '{output_file}'...")
+
+    try:
+        with open(input_file, "r", encoding="utf-8") as infile, open(output_file, "w", encoding="utf-8") as outfile:
+            for line in infile:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    data = json.loads(line_str)
+
+                    inst = data.get("instruction", "").strip()
+                    inp = data.get("input", "").strip()
+                    out = data.get("output", "").strip()
+
+                    if not inst or not out:
+                        continue
+
+                    if inp:
+                        full_text = f"### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n{out}"
+                    else:
+                        full_text = f"### Instruction:\n{inst}\n\n### Response:\n{out}"
+
+                    outfile.write(json.dumps({"text": full_text}, ensure_ascii=False) + "\n")
+                    count += 1
+                except Exception:
+                    continue
+
+        print(f"✅ Fichier Hugging Face '{output_file}' généré avec succès ({count} exemples).")
+        return output_file
+    except Exception as e:
+        print(f"❌ Erreur lors de la préparation HF pour '{input_file}': {e}")
+        return None
+
     return qa_list
