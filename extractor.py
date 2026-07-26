@@ -1,17 +1,13 @@
 import os
 import fitz  # PyMuPDF
 import zipfile
-import rarfile
 from PIL import Image
 import subprocess
-from pptx import Presentation
-import pandas as pd
 import tempfile
-from bs4 import BeautifulSoup
-import ebooklib
-from ebooklib import epub
 
-from ocr_engines import ocr_image, ocr_pdf, structured_parse, is_paddleocr_available
+from document_ir import DocumentIR, blocks_from_text, create_document
+from logger import log_error as _log_error
+from ocr_engines import ocr_image, ocr_pdf, structured_parse
 from transcriber import (
     transcribe_audio, transcribe_video,
     AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
@@ -76,7 +72,18 @@ def configure_whisper(model="base", device="cpu", lang=None):
     print(f"[Whisper] Configured: model={model}, device={device}, lang={lang_display}")
 
 
-from logger import log_error as _log_error
+def extraction_config():
+    """Return the active extraction configuration for cache invalidation."""
+    return {
+        "ocr_engine": _ocr_engine,
+        "ocr_device": _ocr_device,
+        "ocr_lang": _ocr_lang,
+        "ocr_dpi": _ocr_dpi,
+        "ocr_max_pages": _ocr_max_pages,
+        "whisper_model": _whisper_model,
+        "whisper_device": _whisper_device,
+        "whisper_lang": _whisper_lang,
+    }
 
 def log_error(filepath, error_msg):
     _log_error(filepath, error_msg, category="EXTRACTION")
@@ -166,6 +173,7 @@ def extract_text_from_cbz_cbr(path):
                         img = Image.open(file)
                         text += ocr_image(img, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang) + "\n"
         elif ext == '.cbr':
+            import rarfile
             with rarfile.RarFile(path, 'r') as archive:
                 image_files = [f for f in archive.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
                 image_files.sort()
@@ -180,6 +188,7 @@ def extract_text_from_cbz_cbr(path):
 
 def extract_text_from_pptx(path):
     try:
+        from pptx import Presentation
         prs = Presentation(path)
         text = ""
         for slide in prs.slides:
@@ -202,6 +211,7 @@ def extract_text_from_doc(path):
 
 def extract_text_from_excel(path):
     try:
+        import pandas as pd
         text = ""
         # Read all sheets
         dfs = pd.read_excel(path, sheet_name=None)
@@ -216,6 +226,7 @@ def extract_text_from_excel(path):
 
 def extract_text_from_html(path):
     try:
+        from bs4 import BeautifulSoup
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             soup = BeautifulSoup(f, 'html.parser')
             return soup.get_text(separator='\n', strip=True)
@@ -225,6 +236,7 @@ def extract_text_from_html(path):
 
 def extract_text_from_chm(path):
     try:
+        from bs4 import BeautifulSoup
         text = ""
         # Create a temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -248,6 +260,9 @@ def extract_text_from_chm(path):
 
 def extract_text_from_epub(path):
     try:
+        import ebooklib
+        from bs4 import BeautifulSoup
+        from ebooklib import epub
         book = epub.read_epub(path, options={'ignore_ncx': True})
         text = ""
         for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
@@ -348,3 +363,162 @@ def extract_text(path, structured=False):
     else:
         log_error(path, f"Unsupported file extension: {ext}")
         return ""
+
+
+def _pdf_document(path, source_sha256, structured=False):
+    """Extract a PDF page by page while preserving provenance.
+
+    Sparse pages are OCRed individually.  This avoids the previous all-or-nothing
+    fallback where one scanned page inside an otherwise digital PDF was lost.
+    """
+    document = create_document(path, source_sha256=source_sha256)
+
+    if structured:
+        structured_text = structured_parse(path, device=_ocr_device)
+        if structured_text:
+            document.blocks = blocks_from_text(
+                structured_text,
+                document.id,
+                extraction_method="paddle-structure-v3",
+            )
+            document.metadata.update(
+                {"structured": True, "extraction_method": "paddle-structure-v3"}
+            )
+            return document
+        document.diagnostics.append(
+            {
+                "level": "warning",
+                "code": "structured_parse_failed",
+                "message": "PP-StructureV3 failed; standard page extraction was used.",
+            }
+        )
+
+    ocr_pages = 0
+    methods = set()
+    try:
+        with fitz.open(path) as pdf:
+            document.metadata["page_count"] = len(pdf)
+            for page_index, page in enumerate(pdf):
+                page_number = page_index + 1
+                native_text = page.get_text()
+                page_text = native_text
+                method = "pymupdf"
+                sparse = len(native_text.strip()) < 50
+                within_ocr_limit = _ocr_max_pages == 0 or ocr_pages < _ocr_max_pages
+
+                if sparse and within_ocr_limit:
+                    try:
+                        zoom = _ocr_dpi / 72.0
+                        pixmap = page.get_pixmap(
+                            matrix=fitz.Matrix(zoom, zoom), alpha=False
+                        )
+                        image = Image.frombytes(
+                            "RGB",
+                            (pixmap.width, pixmap.height),
+                            pixmap.samples,
+                        )
+                        ocr_text = ocr_image(
+                            image,
+                            engine=_ocr_engine,
+                            device=_ocr_device,
+                            lang=_ocr_lang,
+                        )
+                        ocr_pages += 1
+                        if ocr_text and ocr_text.strip():
+                            page_text = ocr_text
+                            method = f"{_ocr_engine}-ocr"
+                        elif not native_text.strip():
+                            document.diagnostics.append(
+                                {
+                                    "level": "warning",
+                                    "code": "empty_page",
+                                    "page": page_number,
+                                    "message": "Native extraction and OCR returned no text.",
+                                }
+                            )
+                    except Exception as exc:
+                        document.diagnostics.append(
+                            {
+                                "level": "warning",
+                                "code": "page_ocr_failed",
+                                "page": page_number,
+                                "message": str(exc),
+                            }
+                        )
+
+                if page_text and page_text.strip():
+                    methods.add(method)
+                    document.blocks.extend(
+                        blocks_from_text(
+                            page_text,
+                            document.id,
+                            extraction_method=method,
+                            page=page_number,
+                            id_prefix=f"{document.id}/page/{page_number}",
+                        )
+                    )
+    except Exception as exc:
+        document.diagnostics.append(
+            {
+                "level": "error",
+                "code": "pdf_open_failed",
+                "message": str(exc),
+            }
+        )
+        # Retain the legacy whole-document fallback for damaged PDFs.
+        fallback_text = extract_text_from_pdf_ocr(path)
+        document.blocks = blocks_from_text(
+            fallback_text,
+            document.id,
+            extraction_method=f"{_ocr_engine}-ocr",
+        )
+        if fallback_text.strip():
+            methods.add(f"{_ocr_engine}-ocr")
+
+    document.metadata.update(
+        {
+            "structured": False,
+            "ocr_pages": ocr_pages,
+            "extraction_methods": sorted(methods),
+        }
+    )
+    return document
+
+
+def extract_document(path, structured=False, source_sha256=None) -> DocumentIR:
+    """Extract *path* into the structured, engine-neutral document model."""
+    document = create_document(path, source_sha256=source_sha256)
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".pdf":
+        return _pdf_document(path, document.source_sha256, structured=structured)
+
+    text = extract_text(path, structured=structured)
+    method_by_extension = {
+        ".txt": "plain-text",
+        ".md": "markdown",
+        ".rst": "plain-text",
+        ".docx": "python-docx",
+        ".doc": "antiword",
+        ".pptx": "python-pptx",
+        ".xls": "pandas",
+        ".xlsx": "pandas",
+        ".html": "beautifulsoup",
+        ".htm": "beautifulsoup",
+        ".chm": "chmlib",
+        ".epub": "ebooklib",
+    }
+    if ext in AUDIO_EXTENSIONS or ext in VIDEO_EXTENSIONS:
+        method = "faster-whisper"
+    elif ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".cbz", ".cbr"}:
+        method = f"{_ocr_engine}-ocr"
+    else:
+        method = method_by_extension.get(ext, "unknown")
+
+    document.blocks = blocks_from_text(
+        text,
+        document.id,
+        extraction_method=method,
+    )
+    document.metadata["extraction_methods"] = [method] if document.blocks else []
+    return document

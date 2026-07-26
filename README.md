@@ -1,6 +1,6 @@
 # Dataminder: Offline Document Ingestion, OCR & RAG Dataset Generator via Local LLMs
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
 ![Ollama](https://img.shields.io/badge/AI-Ollama-black?logo=ollama&logoColor=white)
 ![PaddleOCR](https://img.shields.io/badge/OCR-PaddleOCR%20PP--OCRv5-blue?logo=paddle&logoColor=white)
 ![Tesseract OCR](https://img.shields.io/badge/OCR-Tesseract%20(fallback)-green)
@@ -15,7 +15,11 @@
 - **Deep Learning OCR:** PaddleOCR PP-OCRv5 available as an option — 13% more accurate than previous generation, 109 languages, auto orientation/distortion correction.
 - **Structured Document Parsing:** Optional PP-StructureV3 mode extracts tables, formulas, and layout as structured Markdown.
 - **Smart OCR Fallback:** Automatically detects scanned PDFs/images and applies OCR. Falls back to Tesseract or PaddleOCR depending on active options and availability.
-- **Fail-Safe Pipeline:** Continuous processing with automatic skipped files, resume support, and comprehensive error logging.
+- **Traceable RAG Chunks:** Emits JSONL chunks with document, block, page, heading, and extraction-method provenance.
+- **Mixed-PDF OCR:** Evaluates PDF pages individually and OCRs sparse pages without reprocessing healthy digital pages.
+- **Reproducible Generation:** Temperature defaults to zero, optional seeds are forwarded to Ollama/vLLM, and prompt revisions invalidate stale caches.
+- **Content-Aware Resume:** Reprocesses only when the source content, prompt, model, extraction, or generation configuration changes.
+- **Observable, Fail-Safe Pipeline:** Atomic outputs, collision-free nested paths, structured run reports, resume support, and comprehensive error logging.
 
 ## Directory Structure
 
@@ -25,7 +29,12 @@ All data lives inside the `data/` directory:
 dataminder/
 ├── data/
 │   ├── source/          # Input: place your documents here (pdf, docx, epub, images, audio, video...)
-│   ├── export/          # Output: AI-generated Markdown summaries (.md)
+│   ├── export/          # Output: summaries + structured/RAG sidecars
+│   │   ├── <source-name>.<ext>.md             # AI summary (or raw text with --level 0)
+│   │   ├── <source-name>.<ext>.chunks.jsonl   # Traceable RAG chunks
+│   │   ├── <source-name>.<ext>.document.json  # Full DocumentIR block tree
+│   │   ├── .dataminder-manifest.json          # Content/config-aware resume state
+│   │   └── .dataminder-last-run.json          # Latest structured execution report
 │   ├── results/         # Output: final QA datasets after deduplication
 │   │   ├── dataset_qa.json            # Deduplicated Q&A pairs (Alpaca format)
 │   │   ├── dataset_qa.md              # Human-readable Q&A pairs
@@ -33,6 +42,13 @@ dataminder/
 │   │   └── dataset_qa_enriched.json   # Enriched dataset for LLM fine-tuning
 │   └── error.log        # Centralized error log
 ├── main.py              # Entry point
+├── document_ir.py       # Structured document/block model and RAG chunker
+├── document_parser.py   # Native/Marker/auto parser selection
+├── marker_provider.py   # Optional Marker-to-DocumentIR adapter
+├── processing_manifest.py # Atomic outputs and content-aware resume state
+├── run_report.py        # Per-run metrics and document outcomes
+├── benchmark.py         # Parser quality benchmark and regression gate
+├── benchmarks/          # Example corpus and benchmark documentation
 ├── extractor.py         # Text extraction from all formats
 ├── summarizer.py        # AI summarization via LLM
 ├── qa_generator.py      # Q&A dataset generation & enrichment
@@ -55,7 +71,7 @@ dataminder/
 ## Prerequisites
 
 - Linux (Ubuntu/Debian) or macOS
-- Python 3.8+
+- Python 3.10+
 - [Ollama](https://ollama.com/) installed and running locally.
 - An Ollama model downloaded (e.g., `gemma3:4b-it-q4_K_M`, `gemma3:12b`, `mistral`). To download a model, run in your terminal: `ollama pull gemma3:4b-it-q4_K_M`.
 
@@ -79,11 +95,54 @@ chmod +x install.sh
 
 ### PaddleOCR Installation (Recommended)
 
-PaddleOCR is included in the Python dependencies (`requirements.txt`). It will be installed automatically with `pip install -r requirements.txt`.
+PaddleOCR and the CPU build of PaddlePaddle are included in
+`requirements.txt`. They will be installed automatically with
+`pip install -r requirements.txt`.
 
-For GPU acceleration (CUDA), install the GPU variant of PaddlePaddle:
+For GPU acceleration (CUDA), replace the CPU runtime with the GPU variant; do
+not install both runtimes in the same environment:
 ```bash
+pip uninstall -y paddlepaddle
 pip install paddlepaddle-gpu
+```
+
+### Marker backend (optional)
+
+Marker can be installed as an optional, local document parser:
+
+```bash
+pip install -r requirements-marker.txt
+```
+
+It is never selected by default. `--parser marker` is strict and reports Marker
+errors; `--parser auto` uses Marker for compatible documents when available and
+falls back to the native parser with a diagnostic. Dataminder disables Marker's
+LLM correction so choosing this backend does not silently send content to a
+cloud model.
+
+Marker's Python code is Apache 2.0, but its model weights have a separate
+modified OpenRAIL-M license. Review that license before commercial deployment.
+
+### Modular installation
+
+`pyproject.toml` exposes smaller dependency groups for development and
+specialized deployments:
+
+```bash
+# Lightweight core
+pip install -e .
+
+# Common document formats and Tesseract
+pip install -e ".[documents,tesseract]"
+
+# Choose exactly one Paddle runtime
+pip install -e ".[paddle-cpu]"
+# or: pip install -e ".[paddle-gpu]"
+
+# Optional subsystems
+pip install -e ".[audio]"
+pip install -e ".[marker]"
+pip install -e ".[dev]"
 ```
 
 ## Usage
@@ -102,7 +161,7 @@ Here are the most common commands you will need:
   ```bash
   python main.py
   ```
-- **Q&A Generation:** Read the summaries from `data/export/` and create a Q&A dataset in `data/results/`:
+- **Q&A Generation:** Prefer traceable source chunks and create a Q&A dataset in `data/results/`:
   ```bash
   python main.py --qa
   ```
@@ -125,6 +184,11 @@ Here are the most common commands you will need:
 - **Structured PDF parsing:** Extract tables, formulas, and layout from PDFs:
   ```bash
   python main.py --structured
+  ```
+- **Parse documents with Marker:**
+  ```bash
+  python main.py --parser marker --marker-mode fast
+  python main.py --parser auto --marker-mode balanced
   ```
 - **Use PaddleOCR instead of Tesseract:**
   ```bash
@@ -169,26 +233,105 @@ Here are the most common commands you will need:
    python main.py --source ./my_documents --dest ./my_summaries --model llama3 --level 7
    ```
    
-   The output files will keep their original name but with a `.md` extension (e.g., `document.md`). If a summary already exists for a file, it will automatically be skipped, which makes resuming interrupted jobs easy!
+   Output paths preserve the source hierarchy and full filename. For example,
+   `data/source/client-a/document.pdf` produces:
+
+   - `data/export/client-a/document.pdf.md`
+   - `data/export/client-a/document.pdf.chunks.jsonl`
+   - `data/export/client-a/document.pdf.document.json`
+
+   Keeping the original extension prevents `document.pdf` and `document.docx`
+   from overwriting each other. A source is skipped only when its SHA-256 hash,
+   pipeline configuration, and all expected outputs match the processing
+   manifest. Editing a source or changing the model, summary level, prompt
+   revision, OCR configuration, parser, structured mode, temperature, or seed
+   automatically invalidates the cached result. Q&A resume records use the
+   same principle and ignore raw pairs produced by an incompatible generation
+   configuration.
+
+## Structured and RAG outputs
+
+`*.document.json` is the lossless intermediate representation used by the
+pipeline. It contains document metadata, diagnostics, and blocks with stable
+IDs, page numbers, heading paths, block types, extraction methods, and optional
+coordinates/confidence fields.
+
+`*.chunks.jsonl` contains one JSON object per RAG-ready chunk. Each object keeps
+the source-relative path, content-addressed document ID, source block IDs,
+pages, heading hierarchy, block types, and extraction methods. These chunks
+represent extracted source material; they are intentionally independent from
+the LLM-generated summary.
+
+## Reproducibility and run reports
+
+LLM temperature defaults to `0`. Use `--seed` when the selected Ollama or vLLM
+backend supports seeded generation:
+
+```bash
+python main.py --temperature 0 --seed 42
+```
+
+The pipeline records only non-secret generation settings in its cache
+fingerprint; API keys are never written to manifests or reports. Every
+document-processing run atomically writes
+`DEST/.dataminder-last-run.json`. It includes timestamps, configuration,
+success/skipped/failed counts, parser and extraction methods, diagnostics,
+character/chunk counts, per-stage durations, errors, and output paths. Use
+`--report ./reports/latest.json` to select another location.
+
+## Parser quality benchmarks
+
+Dataminder includes a reproducible benchmark runner. Corpus manifests can
+define required and forbidden phrases, minimum output length, expected pages
+and block types, plus an optional reference transcription.
+
+```bash
+# Native regression gate
+python benchmark.py \
+  --corpus benchmarks/corpus.example.jsonl \
+  --parsers native \
+  --min-score 0.90 \
+  --output benchmark-report.json
+
+# Compare local backends after installing Marker
+python benchmark.py \
+  --corpus /path/to/private-corpus.jsonl \
+  --parsers native,marker,auto \
+  --marker-mode fast \
+  --output benchmark-report.json
+```
+
+The report contains per-document component scores, extraction time,
+character/block/chunk counts, diagnostics, and a summary for each parser. See
+`benchmarks/README.md` for the corpus schema. The native quality gate also runs
+in CI on Python 3.10, 3.11, and 3.12.
 
 ## Q&A Dataset Generation
 
-If you want to use the generated summaries to fine-tune an AI model, Dataminder includes a dedicated Q&A generator mode.
-It will read all `.md` files in the source directory and use the AI to generate high-quality, non-redundant Question/Answer pairs.
+Dataminder includes a dedicated Q&A generator mode for fine-tuning datasets.
+By default it uses `*.chunks.jsonl` when those files are present, so questions
+are generated from extracted source material rather than from an
+LLM-generated summary. Use `--qa-source summaries` to retain the legacy flow.
 
 To use this mode, simply add the `--qa` flag:
 ```bash
 python main.py --qa
 ```
 
-By default in `--qa` mode, Dataminder will automatically read the `.md` files from `data/export/` (where your summaries are) and will output the dataset files into `data/results/`. You can still override these with `--source` and `--dest` if needed.
+By default in `--qa` mode, Dataminder reads `data/export/` and writes to
+`data/results/`. `--qa-source auto` prefers chunks and falls back to Markdown
+summaries when no chunk files exist.
 
 This will create three files in `data/results/`:
 1. `dataset_qa.json` : A structured dataset in standard JSON format (Alpaca style) ready for fine-tuning.
 2. `dataset_qa.md` : A human-readable Markdown file containing all the Q&A pairs.
-3. `dataset_qa_raw.jsonl` : The raw Q&A pairs before deduplication (used for resume support).
+3. `dataset_qa_raw_chunks.jsonl` : Raw chunk-derived Q&A pairs and provenance.
+   Summary mode retains the legacy `dataset_qa_raw.jsonl` filename.
 
-**Note:** The script will first generate all questions for all files, and then run a programmatic deduplication pass (removing any questions that are 85% similar to each other) before saving the final `.json` and `.md` files.
+Final `dataset_qa.json` entries include `_meta.source` with their document,
+chunk, block, page, and heading provenance. Cleaned/Hugging Face exports omit
+this operational metadata. Resume state uses file and chunk hashes, so changed
+chunks are regenerated while unchanged chunks are retained.
 
 ## Full Pipeline (--full)
 
@@ -198,7 +341,7 @@ python main.py --full
 ```
 This will:
 1. Process all documents from `data/source/` and put the `.md` summaries in `data/export/`.
-2. Automatically read the `data/export/` summaries and generate the deduplicated dataset in `data/results/`.
+2. Read the source-derived chunks from `data/export/` and generate the deduplicated dataset in `data/results/`.
 3. Enrich a fraction of the dataset (default: 30%) with structured cybersecurity context (MITRE ATT&CK, CVSS, IOC, etc.) and save as `dataset_qa_enriched.json`.
 
 ### Post-Deduplication Enrichment
@@ -273,12 +416,19 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 | `--dest` | `data/export` | Destination directory for summaries |
 | `--model` | `gemma3:4b-it-q4_K_M` | Model name to use |
 | `--level` | `9` | Summarization detail (0-10, 0 = raw text) |
+| `--parser` | `native` | Document parser: `native`, strict `marker`, or `auto` with native fallback |
+| `--marker-mode` | `fast` | Marker mode: `fast` or `balanced` |
 | `--provider` | `ollama` | LLM provider: `ollama` or `vllm` |
 | `--vllm-url` | `http://localhost:8000` | vLLM server URL |
 | `--vllm-key` | *(empty)* | API key for vLLM (optional) |
 | `--ollama-url` | `OLLAMA_HOST` or `http://localhost:11434` | Ollama server URL (Ollama provider only) |
 | `--threads` | *(off)* | Enable parallel chunk processing (default: 5 threads if activated, e.g. `--threads` or `--threads 8`) |
+| `--timeout` | `300` | Per-call LLM timeout in seconds |
+| `--temperature` | `0` | LLM sampling temperature from 0 to 2 |
+| `--seed` | *(unset)* | Optional generation seed forwarded to Ollama/vLLM |
+| `--report` | `DEST/.dataminder-last-run.json` | Document-processing run report path |
 | `--enrich-ratio` | `0.3` | Fraction of deduplicated pairs to enrich (0 = skip, 1.0 = all). Used with `--full` or `--enrich` |
+| `--qa-source` | `auto` | Q&A input: prefer `chunks`, require `chunks`, or use `summaries` |
 | `--ocr-engine` | `tesseract` | OCR engine: `tesseract` (legacy, default) or `paddleocr` (PP-OCRv5, deep learning) |
 | `--paddleocr` | *(flag)* | Enable PaddleOCR PP-OCRv5 (deep learning) instead of Tesseract |
 | `--ocr-device` | `cpu` | Device for OCR inference: `cpu` or `gpu` (PaddleOCR only) |

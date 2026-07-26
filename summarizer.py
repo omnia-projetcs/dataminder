@@ -1,6 +1,17 @@
 import re
 from llm_client import LLMClient
 
+
+SUMMARY_PROMPT_REVISION = 1
+
+
+class SummarizationError(RuntimeError):
+    """Raised when a summary could not be generated.
+
+    Keeping failures out of the returned Markdown prevents them from being
+    cached as if they were valid document content.
+    """
+
 # Pattern to strip conversational preamble (e.g. "Okay, here's a breakdown...")
 _PREAMBLE_RE = re.compile(
     r'\A\s*(?:okay|alright|sure|here(?:\'s| is)|let me|great|certainly|of course|i\'ll)[^\n]*\n+',
@@ -107,5 +118,6 @@ Document:
         )
         return _clean_output(content)
     except Exception as e:
-        print(f"Error communicating with LLM ({llm_client}): {e}")
-        return f"Error during summarization: {e}\n\nCheck that your LLM server is running and the model '{model_name}' is available."
+        raise SummarizationError(
+            f"Could not summarize with model '{model_name}' via {llm_client}: {e}"
+        ) from e

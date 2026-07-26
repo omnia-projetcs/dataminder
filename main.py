@@ -3,21 +3,47 @@ import os
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 
+import json
 import time
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from extractor import extract_text, configure_ocr, configure_whisper
+from document_ir import build_chunks, chunks_to_jsonl, sha256_file
+from document_parser import extract_document
+from extractor import (
+    configure_ocr,
+    configure_whisper,
+    extraction_config,
+)
 from transcriber import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
-from summarizer import summarize_text
+from summarizer import SUMMARY_PROMPT_REVISION, summarize_text
 from llm_client import LLMClient
-from qa_generator import _split_into_chunks
 from logger import log_error as _log_error
+from processing_manifest import (
+    ProcessingManifest,
+    atomic_write_text,
+    output_paths,
+    relative_source_id,
+    stable_fingerprint,
+)
+from run_report import DEFAULT_RUN_REPORT, PipelineRunReport
 from tqdm import tqdm
 
 def log_error(filepath, error_msg):
     _log_error(filepath, error_msg, category="PIPELINE")
 
-def process_documents(source_dir, dest_dir, model_name, level=7, force=False, llm_client=None, num_threads=1, structured=False):
+def process_documents(
+    source_dir,
+    dest_dir,
+    model_name,
+    level=7,
+    force=False,
+    llm_client=None,
+    num_threads=1,
+    structured=False,
+    parser_backend="native",
+    marker_mode="fast",
+    report_path=None,
+):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
 
@@ -26,81 +52,149 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
         os.makedirs(source_dir, exist_ok=True)
 
     os.makedirs(dest_dir, exist_ok=True)
+    resolved_report_path = report_path or os.path.join(dest_dir, DEFAULT_RUN_REPORT)
+    run_report = PipelineRunReport(source_dir, dest_dir)
+    pipeline_config = {
+        "pipeline_revision": 4,
+        "summary_prompt_revision": SUMMARY_PROMPT_REVISION,
+        "model": model_name,
+        "summary_level": level,
+        "structured": structured,
+        "parser_backend": parser_backend,
+        "marker_mode": marker_mode,
+        "extractor": extraction_config(),
+        "llm_generation": (
+            llm_client.generation_config()
+            if hasattr(llm_client, "generation_config")
+            else {
+                "provider": getattr(llm_client, "provider", "unknown"),
+            }
+        ),
+    }
+    run_report.set_configuration(pipeline_config)
+    pipeline_fingerprint = stable_fingerprint(pipeline_config)
     print(f"Scanning '{source_dir}' recursively...")
     
     files_to_process = []
+    supported_exts = {
+        '.txt', '.md', '.rst', '.docx', '.pdf', '.cbz', '.cbr',
+        '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm',
+        '.epub', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'
+    } | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
     for root, _, files in os.walk(source_dir):
         for file in files:
             ext = os.path.splitext(file)[1].lower()
-            supported_exts = {
-                '.txt', '.md', '.rst', '.docx', '.pdf', '.cbz', '.cbr',
-                '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm',
-                '.epub', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'
-            } | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
             if ext in supported_exts:
                 files_to_process.append(os.path.join(root, file))
+    files_to_process.sort()
     
     if not files_to_process:
         print(f"No supported documents found in '{source_dir}'.")
         print("Supported: txt, md, rst, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm, epub, png, jpg, webp, bmp, tiff, mp3, wav, ogg, flac, m4a, mp4, mkv, avi, mov, webm")
-        return
+        return run_report.write(resolved_report_path)
         
-    # Resume: filter out already processed files unless --force
+    manifest = ProcessingManifest(dest_dir)
+    # Resume only when content, configuration, and every expected output match.
     skipped = 0
-    if not force:
-        filtered = []
-        for fp in files_to_process:
-            base_name, _ = os.path.splitext(os.path.basename(fp))
-            output_path = os.path.join(dest_dir, f"{base_name}.md")
-            if os.path.exists(output_path):
-                skipped += 1
-            else:
-                filtered.append(fp)
-        files_to_process = filtered
+    work_items = []
+    for filepath in files_to_process:
+        source_id = relative_source_id(filepath, source_dir)
+        outputs = output_paths(filepath, source_dir, dest_dir)
+        try:
+            source_sha256 = sha256_file(filepath)
+        except OSError as exc:
+            log_error(filepath, f"Could not hash source file: {exc}")
+            run_report.add_document(
+                source_id=source_id,
+                status="failed",
+                error=f"Could not hash source file: {exc}",
+            )
+            continue
+        if (
+            not force
+            and manifest.is_current(
+                source_id,
+                source_sha256=source_sha256,
+                pipeline_fingerprint=pipeline_fingerprint,
+                outputs=outputs,
+            )
+        ):
+            skipped += 1
+            run_report.add_document(
+                source_id=source_id,
+                status="skipped",
+                source_sha256=source_sha256,
+                outputs={
+                    name: os.path.relpath(path, dest_dir).replace(os.sep, "/")
+                    for name, path in outputs.items()
+                },
+            )
+            continue
+        work_items.append((filepath, source_id, source_sha256, outputs))
     
     if skipped:
-        print(f"Resuming: {skipped} files already processed (use --force to reprocess). {len(files_to_process)} remaining.")
+        print(f"Resuming: {skipped} unchanged files already processed (use --force to reprocess). {len(work_items)} remaining.")
     
-    if not files_to_process:
+    if not work_items:
         print("All files already processed. Nothing to do.")
-        return
+        return run_report.write(resolved_report_path)
     
-    print(f"Processing {len(files_to_process)} documents...")
+    print(f"Processing {len(work_items)} documents...")
     if num_threads > 1:
         print(f"Using {num_threads} threads for parallel chunk processing.")
     
-    pbar = tqdm(files_to_process, desc="Processing", unit="doc")
-    for input_path in pbar:
+    pbar = tqdm(work_items, desc="Processing", unit="doc")
+    for input_path, source_id, source_sha256, outputs in pbar:
         filename = os.path.basename(input_path)
-        base_name, _ = os.path.splitext(filename)
-        
-        # Output filename
-        output_filename = f"{base_name}.md"
-        output_path = os.path.join(dest_dir, output_filename)
+        document_started = time.perf_counter()
         
         try:
-                
             pbar.set_postfix({"file": filename[:20], "step": "Extracting text"})
-            text = extract_text(input_path, structured=structured)
+            extraction_started = time.perf_counter()
+            document = extract_document(
+                input_path,
+                parser=parser_backend,
+                marker_mode=marker_mode,
+                structured=structured,
+                source_sha256=source_sha256,
+            )
+            extraction_elapsed = time.perf_counter() - extraction_started
+            document.metadata["source_relative_path"] = source_id
+            document.metadata["pipeline_config"] = pipeline_config
+            text = document.text
             
             if not text.strip():
                 tqdm.write(f"\n[{filename}] No text could be extracted. Skipping.")
                 log_error(input_path, "No text extracted (unsupported or OCR failed).")
+                run_report.add_document(
+                    source_id=source_id,
+                    status="failed",
+                    source_sha256=source_sha256,
+                    parser_requested=parser_backend,
+                    parser_used=document.metadata.get("parser", parser_backend),
+                    error="No text extracted (unsupported or OCR failed).",
+                    extraction_seconds=round(extraction_elapsed, 6),
+                    elapsed_seconds=round(
+                        time.perf_counter() - document_started, 6
+                    ),
+                )
                 continue
-                
+
+            rag_chunks = build_chunks(document)
+            summary_started = time.perf_counter()
             if level == 0:
                 pbar.set_postfix({"file": filename[:20], "step": "Saving Raw Text"})
                 summary_md = text
             else:
-                # Split text into chunks to prevent context blowup for large documents
-                chunks = _split_into_chunks(text)
+                # Use document-aware chunks so tables/code/page provenance survive.
+                chunks = [chunk["text"] for chunk in rag_chunks]
 
                 if len(chunks) <= 1:
                     pbar.set_postfix({"file": filename[:20], "step": f"AI Summarizing (L{level})"})
                     t0 = time.time()
                     summary_md = summarize_text(text, model_name=model_name, level=level, llm_client=llm_client)
                     elapsed = time.time() - t0
-                    pbar.set_postfix({"file": filename[:20], "step": f"Done", "time": f"{elapsed:.1f}s"})
+                    pbar.set_postfix({"file": filename[:20], "step": "Done", "time": f"{elapsed:.1f}s"})
                 elif num_threads > 1:
                     # Parallel chunk processing
                     summaries_by_idx = {}
@@ -132,7 +226,7 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
                     summary_md = "\n\n".join(summaries)
                     total_t = sum(chunk_times)
                     avg_t = total_t / len(chunk_times) if chunk_times else 0
-                    pbar.set_postfix({"file": filename[:20], "step": f"Done", "avg": f"{avg_t:.1f}s/chunk"})
+                    pbar.set_postfix({"file": filename[:20], "step": "Done", "avg": f"{avg_t:.1f}s/chunk"})
                 else:
                     summaries = []
                     chunk_times = []
@@ -150,20 +244,67 @@ def process_documents(source_dir, dest_dir, model_name, level=7, force=False, ll
                     summary_md = "\n\n".join(summaries)
                     total_t = sum(chunk_times)
                     avg_t = total_t / len(chunk_times) if chunk_times else 0
-                    pbar.set_postfix({"file": filename[:20], "step": f"Done", "avg": f"{avg_t:.1f}s/chunk"})
+                    pbar.set_postfix({"file": filename[:20], "step": "Done", "avg": f"{avg_t:.1f}s/chunk"})
+            summary_elapsed = time.perf_counter() - summary_started
             
             pbar.set_postfix({"file": filename[:20], "step": "Saving"})
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(summary_md)
-                
+            atomic_write_text(outputs["markdown"], summary_md)
+            atomic_write_text(outputs["chunks"], chunks_to_jsonl(rag_chunks))
+            atomic_write_text(
+                outputs["document"],
+                json.dumps(document.to_dict(), ensure_ascii=False, indent=2) + "\n",
+            )
+            manifest.mark_success(
+                source_id,
+                source_sha256=source_sha256,
+                pipeline_fingerprint=pipeline_fingerprint,
+                outputs=outputs,
+                document_id=document.id,
+            )
+            run_report.add_document(
+                source_id=source_id,
+                status="success",
+                source_sha256=source_sha256,
+                document_id=document.id,
+                parser_requested=parser_backend,
+                parser_used=document.metadata.get("parser", parser_backend),
+                extraction_methods=document.metadata.get(
+                    "extraction_methods", []
+                ),
+                char_count=len(text),
+                block_count=len(document.blocks),
+                chunk_count=len(rag_chunks),
+                diagnostic_count=len(document.diagnostics),
+                extraction_seconds=round(extraction_elapsed, 6),
+                summary_seconds=round(summary_elapsed, 6),
+                elapsed_seconds=round(
+                    time.perf_counter() - document_started, 6
+                ),
+                outputs={
+                    name: os.path.relpath(path, dest_dir).replace(os.sep, "/")
+                    for name, path in outputs.items()
+                },
+            )
+
         except Exception as e:
             error_details = str(e)
             tqdm.write(f"\n[{filename}] Failed with error: {error_details}")
             log_error(input_path, f"Unexpected exception: {error_details}")
+            run_report.add_document(
+                source_id=source_id,
+                status="failed",
+                source_sha256=source_sha256,
+                parser_requested=parser_backend,
+                error=error_details,
+                elapsed_seconds=round(
+                    time.perf_counter() - document_started, 6
+                ),
+            )
             continue
 
     # Unload model from VRAM now that processing is complete (Ollama only)
     llm_client.unload_model(model_name)
+    return run_report.write(resolved_report_path)
 
 
 def _summarize_chunk_timed(chunk, model_name, level, llm_client):
@@ -180,10 +321,25 @@ if __name__ == "__main__":
     parser.add_argument("--dest", default=os.path.join("data", "export"), help="Destination directory for the Markdown summaries (default: data/export).")
     parser.add_argument("--model", default="gemma3:4b-it-q4_K_M", help="Model to use (default: gemma3:4b-it-q4_K_M).")
     parser.add_argument("--level", type=int, default=9, help="Summarization detail level from 1 to 10. 0 means no summarization (saves raw text). Default: 9.")
-    parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads .md files from source and creates a dataset in dest).")
+    parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads RAG chunks when available, otherwise Markdown summaries).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
     parser.add_argument("--enrich", action="store_true", help="Run enrichment only on an existing dataset_qa.json in data/results/.")
     parser.add_argument("--force", action="store_true", help="Force reprocessing of all files, ignoring resume state.")
+
+    # Document parser options
+    parser.add_argument(
+        "--parser",
+        dest="parser_backend",
+        default="native",
+        choices=["native", "marker", "auto"],
+        help="Document parser: native (default), marker (strict), or auto (Marker with native fallback).",
+    )
+    parser.add_argument(
+        "--marker-mode",
+        default="fast",
+        choices=["fast", "balanced"],
+        help="Marker conversion mode when --parser=marker/auto (default: fast).",
+    )
     
     # vLLM / provider options
     parser.add_argument("--provider", default="ollama", choices=["ollama", "vllm"], help="LLM provider to use: 'ollama' (local, default) or 'vllm' (remote OpenAI-compatible server).")
@@ -192,6 +348,26 @@ if __name__ == "__main__":
     parser.add_argument("--ollama-url", default=None, help="Ollama server URL (default: OLLAMA_HOST or http://localhost:11434). Only used when --provider=ollama.")
     parser.add_argument('--threads', type=int, nargs='?', const=5, default=None, help="Enable multithreaded chunk processing. Without a value, defaults to 5 threads. You can specify a custom number (e.g. --threads 8). Omit this flag entirely for sequential processing.")
     parser.add_argument('--timeout', type=int, default=300, help="Timeout in seconds for each LLM call (default: 300). The call will be retried up to 3 times with exponential backoff before giving up.")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="LLM sampling temperature from 0 to 2 (default: 0 for reproducibility).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional generation seed passed to Ollama/vLLM.",
+    )
+    parser.add_argument(
+        "--report",
+        default=None,
+        help=(
+            "Path for the document-processing run report "
+            "(default: DEST/.dataminder-last-run.json)."
+        ),
+    )
     
     # OCR engine options (PaddleOCR integration)
     parser.add_argument("--ocr-engine", default="tesseract", choices=["paddleocr", "tesseract"], help="OCR engine to use: 'tesseract' (legacy, default) or 'paddleocr' (PP-OCRv5, deep learning).")
@@ -209,6 +385,12 @@ if __name__ == "__main__":
 
     # RAG options
     parser.add_argument('--enrich-ratio', type=float, default=0.3, help="Post-deduplication enrichment ratio (default: 0.3)")
+    parser.add_argument(
+        "--qa-source",
+        default="auto",
+        choices=["auto", "chunks", "summaries"],
+        help="Q&A source: prefer chunks automatically (default), require chunks, or use summaries.",
+    )
     
     args = parser.parse_args()
     
@@ -218,7 +400,9 @@ if __name__ == "__main__":
         vllm_url=args.vllm_url,
         vllm_api_key=args.vllm_key,
         timeout=args.timeout,
-        ollama_url=args.ollama_url
+        ollama_url=args.ollama_url,
+        temperature=args.temperature,
+        seed=args.seed,
     )
     num_threads = args.threads if args.threads else 1
     
@@ -235,11 +419,33 @@ if __name__ == "__main__":
         from qa_generator import generate_qa_dataset
         print("--- Starting FULL Pipeline ---")
         print("\n[Step 1/2] Document Processing")
-        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads, structured=args.structured)
+        process_documents(
+            args.source,
+            args.dest,
+            args.model,
+            args.level,
+            force=args.force,
+            llm_client=llm_client,
+            num_threads=num_threads,
+            structured=args.structured,
+            parser_backend=args.parser_backend,
+            marker_mode=args.marker_mode,
+            report_path=args.report,
+        )
         
         print("\n[Step 2/2] Q&A Dataset Generation")
         qa_dest = os.path.join("data", "results")
-        generate_qa_dataset(args.dest, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force, enrich=True, enrich_ratio=args.enrich_ratio)
+        generate_qa_dataset(
+            args.dest,
+            qa_dest,
+            args.model,
+            llm_client=llm_client,
+            num_threads=num_threads,
+            force=args.force,
+            enrich=True,
+            enrich_ratio=args.enrich_ratio,
+            input_format=args.qa_source,
+        )
         print("\n--- Full Pipeline Complete ---")
     elif args.qa:
         from qa_generator import generate_qa_dataset
@@ -251,7 +457,16 @@ if __name__ == "__main__":
         qa_source = default_dest if args.source == default_source else args.source
         qa_dest = os.path.join("data", "results") if args.dest == default_dest else args.dest
         
-        generate_qa_dataset(qa_source, qa_dest, args.model, llm_client=llm_client, num_threads=num_threads, force=args.force, enrich_ratio=args.enrich_ratio)
+        generate_qa_dataset(
+            qa_source,
+            qa_dest,
+            args.model,
+            llm_client=llm_client,
+            num_threads=num_threads,
+            force=args.force,
+            enrich_ratio=args.enrich_ratio,
+            input_format=args.qa_source,
+        )
     elif args.enrich:
         import json
         from qa_generator import _enrich_after_dedup
@@ -287,4 +502,16 @@ if __name__ == "__main__":
         print("\n--- Enrichment Complete ---")
     else:
         print("--- Starting document processing ---")
-        process_documents(args.source, args.dest, args.model, args.level, force=args.force, llm_client=llm_client, num_threads=num_threads, structured=args.structured)
+        process_documents(
+            args.source,
+            args.dest,
+            args.model,
+            args.level,
+            force=args.force,
+            llm_client=llm_client,
+            num_threads=num_threads,
+            structured=args.structured,
+            parser_backend=args.parser_backend,
+            marker_mode=args.marker_mode,
+            report_path=args.report,
+        )

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataminder"
+version = "0.2.0"
+description = "Offline multimodal document ingestion and traceable RAG dataset generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Nicolas Hanteville" },
+]
+dependencies = [
+    "PyMuPDF>=1.24",
+    "Pillow>=10",
+    "beautifulsoup4>=4.12",
+    "requests>=2.31",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+documents = [
+    "python-docx>=1.1",
+    "rarfile>=4.2",
+    "python-pptx>=1.0",
+    "pandas>=2.1",
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+    "EbookLib>=0.18",
+]
+tesseract = [
+    "pytesseract>=0.3.13",
+]
+paddle-cpu = [
+    "paddleocr",
+    "paddlepaddle",
+]
+paddle-gpu = [
+    "paddleocr",
+    "paddlepaddle-gpu",
+]
+audio = [
+    "faster-whisper>=1.0",
+]
+marker = [
+    "marker-pdf[full]>=2.0.0,<3",
+]
+dev = [
+    "ruff>=0.5",
+]
+
+[project.scripts]
+dataminder-benchmark = "benchmark:main"
+
+[tool.setuptools]
+py-modules = [
+    "benchmark",
+    "document_ir",
+    "document_parser",
+    "extractor",
+    "llm_client",
+    "logger",
+    "main",
+    "marker_provider",
+    "ocr_engines",
+    "processing_manifest",
+    "qa_generator",
+    "run_report",
+    "summarizer",
+    "transcriber",
+]
+
+[tool.ruff]
+target-version = "py310"
+exclude = ["venv"]

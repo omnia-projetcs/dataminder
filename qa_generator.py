@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import hashlib
 import signal
 import sys
 from collections import defaultdict
@@ -11,9 +12,12 @@ import time
 import random
 from llm_client import LLMClient
 from logger import log_error as _log_error
+from document_ir import sha256_file
+from processing_manifest import relative_source_id, stable_fingerprint
 
 
 CHUNK_SIZE = 5000
+QA_PROMPT_REVISION = 1
 
 # --- Graceful shutdown on SIGTERM / SIGINT ---
 _shutdown_requested = False
@@ -57,6 +61,39 @@ def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
         chunks.append(text[start:split_point].strip())
         # Advance past the split delimiter to guarantee forward progress
         start = split_point + 1
+    return chunks
+
+
+def _read_qa_input_chunks(input_path, input_format):
+    """Return ``(text, provenance)`` chunks from summaries or RAG JSONL."""
+    if input_format == "summaries":
+        with open(input_path, "r", encoding="utf-8") as source:
+            text = source.read()
+        return [(chunk, {}) for chunk in _split_into_chunks(text)]
+
+    chunks = []
+    with open(input_path, "r", encoding="utf-8") as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid chunk JSON on line {line_number}: {exc}"
+                ) from exc
+            text = item.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            provenance = {
+                "source_chunk_id": item.get("id"),
+                "source_document_id": item.get("document_id"),
+                "source_document": item.get("source_path"),
+                "source_pages": item.get("pages", []),
+                "source_block_ids": item.get("block_ids", []),
+                "source_heading_path": item.get("heading_path", []),
+            }
+            chunks.append((text, provenance))
     return chunks
 
 
@@ -519,14 +556,29 @@ def _get_ngrams(text, n=3):
 
 
 def _minhash_signature(shingles, num_hashes=64):
-    """Compute a MinHash signature for a set of shingles.
-    Uses Python's built-in hash() with seed mixing instead of hashlib.md5
-    for ~20-50x faster hashing (non-cryptographic, fine for similarity)."""
+    """Compute a reproducible MinHash signature for a set of shingles.
+
+    Python's built-in string hash is randomized between processes, which made
+    the LSH candidate set vary between runs. BLAKE2 creates stable base hashes;
+    SplitMix64-style mixing cheaply derives deterministic permutations.
+    """
+    mask = 0xFFFFFFFFFFFFFFFF
+    base_hashes = [
+        int.from_bytes(
+            hashlib.blake2b(shingle.encode("utf-8"), digest_size=8).digest(),
+            "big",
+        )
+        for shingle in shingles
+    ]
     signature = []
     for i in range(num_hashes):
         min_hash = float('inf')
-        for shingle in shingles:
-            h = hash((i, shingle)) & 0xFFFFFFFFFFFFFFFF  # ensure positive
+        seed = (0x9E3779B97F4A7C15 * (i + 1)) & mask
+        for base_hash in base_hashes:
+            h = (base_hash + seed) & mask
+            h = ((h ^ (h >> 30)) * 0xBF58476D1CE4E5B9) & mask
+            h = ((h ^ (h >> 27)) * 0x94D049BB133111EB) & mask
+            h ^= h >> 31
             if h < min_hash:
                 min_hash = h
         signature.append(min_hash)
@@ -539,7 +591,13 @@ def _lsh_buckets(signature, num_bands=16):
     bands = []
     for i in range(num_bands):
         band = signature[i * band_size:(i + 1) * band_size]
-        bands.append(hash(band))
+        payload = b"".join(value.to_bytes(8, "big") for value in band)
+        bands.append(
+            int.from_bytes(
+                hashlib.blake2b(payload, digest_size=8).digest(),
+                "big",
+            )
+        )
     return bands
 
 
@@ -606,15 +664,14 @@ def deduplicate_qa(qa_list, threshold=0.85):
     unique_qa = [qa for idx, qa in enumerate(deduped_exact) if idx not in removed]
     return unique_qa
 
-def _load_already_processed(raw_path):
+def _load_already_processed(raw_path, pipeline_fingerprint):
     """Read the raw JSONL file and return chunk-level resume state.
 
     Returns:
-        dict[str, set[int]]: mapping of source filename -> set of chunk indices
-        already processed.  Entries without a ``_chunk_idx`` field (legacy format)
-        are treated as chunk -1 which causes the whole file to be considered done.
+        dict[str, dict[int, str | None]]: source -> chunk index -> content hash.
+        Legacy entries without hashes are loaded but are not trusted for skips.
     """
-    done = defaultdict(set)
+    done = defaultdict(dict)
     if not os.path.exists(raw_path):
         return done
     with open(raw_path, 'r', encoding='utf-8') as f:
@@ -624,16 +681,27 @@ def _load_already_processed(raw_path):
                 continue
             try:
                 obj = json.loads(line)
+                if obj.get("_pipeline_fingerprint") != pipeline_fingerprint:
+                    continue
                 src = obj.get("_source_file", "")
                 if src:
                     chunk_idx = obj.get("_chunk_idx", -1)
-                    done[src].add(chunk_idx)
+                    content_hash = (
+                        obj.get("_input_sha256")
+                        if chunk_idx == -1
+                        else obj.get("_chunk_hash")
+                    )
+                    done[src][chunk_idx] = content_hash
             except json.JSONDecodeError:
                 continue
     return done
 
 
-def _load_raw_pairs(raw_path):
+def _load_raw_pairs(
+    raw_path,
+    current_input_hashes=None,
+    pipeline_fingerprint=None,
+):
     """Read all Q&A pairs from the raw JSONL file."""
     pairs = []
     if not os.path.exists(raw_path):
@@ -645,16 +713,65 @@ def _load_raw_pairs(raw_path):
                 continue
             try:
                 obj = json.loads(line)
+                if (
+                    pipeline_fingerprint is not None
+                    and obj.get("_pipeline_fingerprint") != pipeline_fingerprint
+                ):
+                    continue
                 if "question" in obj and "answer" in obj:
-                    pairs.append({"question": obj["question"], "answer": obj["answer"]})
+                    source_id = obj.get("_source_file")
+                    recorded_input_hash = obj.get("_input_sha256")
+                    if current_input_hashes is not None and source_id:
+                        if source_id not in current_input_hashes:
+                            continue
+                        if (
+                            recorded_input_hash
+                            and recorded_input_hash != current_input_hashes[source_id]
+                        ):
+                            continue
+                    pair = {
+                        "question": obj["question"],
+                        "answer": obj["answer"],
+                    }
+                    pair.update(
+                        {
+                            key: value
+                            for key, value in obj.items()
+                            if key.startswith("_source_")
+                        }
+                    )
+                    pairs.append(pair)
             except json.JSONDecodeError:
                 continue
     return pairs
 
 
-def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_threads=1, force=False, enrich=False, enrich_ratio=0.3):
+def generate_qa_dataset(
+    source_dir,
+    dest_dir,
+    model_name,
+    llm_client=None,
+    num_threads=1,
+    force=False,
+    enrich=False,
+    enrich_ratio=0.3,
+    input_format="auto",
+):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
+
+    qa_pipeline_config = {
+        "qa_prompt_revision": QA_PROMPT_REVISION,
+        "model": model_name,
+        "llm_generation": (
+            llm_client.generation_config()
+            if hasattr(llm_client, "generation_config")
+            else {
+                "provider": getattr(llm_client, "provider", "unknown"),
+            }
+        ),
+    }
+    qa_pipeline_fingerprint = stable_fingerprint(qa_pipeline_config)
 
     if not os.path.exists(source_dir):
         print(f"Source directory '{source_dir}' does not exist. Creating it now...")
@@ -662,7 +779,34 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
 
     os.makedirs(dest_dir, exist_ok=True)
     
-    raw_jsonl_path = os.path.join(dest_dir, "dataset_qa_raw.jsonl")
+    if input_format not in {"auto", "summaries", "chunks"}:
+        raise ValueError("input_format must be auto, summaries, or chunks")
+
+    markdown_files = []
+    chunk_files = []
+    for root, _, files in os.walk(source_dir):
+        for file in files:
+            path = os.path.join(root, file)
+            if file.lower().endswith(".chunks.jsonl"):
+                chunk_files.append(path)
+            elif file.lower().endswith(".md"):
+                markdown_files.append(path)
+
+    if input_format == "auto":
+        resolved_input_format = "chunks" if chunk_files else "summaries"
+    else:
+        resolved_input_format = input_format
+    files_to_process = (
+        chunk_files if resolved_input_format == "chunks" else markdown_files
+    )
+    files_to_process.sort()
+
+    raw_filename = (
+        "dataset_qa_raw_chunks.jsonl"
+        if resolved_input_format == "chunks"
+        else "dataset_qa_raw.jsonl"
+    )
+    raw_jsonl_path = os.path.join(dest_dir, raw_filename)
     
     if force and os.path.exists(raw_jsonl_path):
         try:
@@ -671,25 +815,48 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
         except Exception as e:
             print(f"Warning: Could not remove {raw_jsonl_path}: {e}")
     
-    files_to_process = []
-    for root, _, files in os.walk(source_dir):
-        for file in files:
-            if file.lower().endswith('.md'):
-                files_to_process.append(os.path.join(root, file))
-                
     if not files_to_process:
-        print(f"No Markdown (.md) files found in '{source_dir}'.")
+        expected = "*.chunks.jsonl" if resolved_input_format == "chunks" else "*.md"
+        print(f"No {expected} files found in '{source_dir}'.")
         return
     
     # Check which files/chunks were already processed (resume support)
-    already_done = _load_already_processed(raw_jsonl_path) if not force else defaultdict(set)
-    # Files where legacy entries (no _chunk_idx) exist are considered fully done
-    fully_done_files = {f for f, chunks in already_done.items() if -1 in chunks}
+    already_done = (
+        _load_already_processed(raw_jsonl_path, qa_pipeline_fingerprint)
+        if not force
+        else defaultdict(dict)
+    )
+    # A file-level sentinel is valid only while the input content hash matches.
+    input_hashes = {
+        relative_source_id(path, source_dir): sha256_file(path)
+        for path in files_to_process
+    }
+    raw_has_other_state = (
+        os.path.exists(raw_jsonl_path)
+        and os.path.getsize(raw_jsonl_path) > 0
+        and not already_done
+    )
+    resume_state_changed = raw_has_other_state or bool(
+        set(already_done) - set(input_hashes)
+    )
+    for source_id, source_hash in input_hashes.items():
+        recorded_hash = already_done.get(source_id, {}).get(-1)
+        if recorded_hash and recorded_hash != source_hash:
+            resume_state_changed = True
+    fully_done_files = set()
+    for path in files_to_process:
+        source_id = relative_source_id(path, source_dir)
+        expected_hash = already_done.get(source_id, {}).get(-1)
+        if expected_hash and expected_hash == input_hashes[source_id]:
+            fully_done_files.add(source_id)
     partially_done_files = {f for f in already_done if f not in fully_done_files}
     if already_done:
         total_before = len(files_to_process)
         # Remove fully-processed files; keep partially-processed ones for chunk-level resume
-        files_to_process = [f for f in files_to_process if os.path.basename(f) not in fully_done_files]
+        files_to_process = [
+            f for f in files_to_process
+            if relative_source_id(f, source_dir) not in fully_done_files
+        ]
         skipped = total_before - len(files_to_process)
         partial_msg = f" ({len(partially_done_files)} partially done — will resume at chunk level)" if partially_done_files else ""
         print(f"Resuming: {skipped} files already processed, {len(files_to_process)} remaining.{partial_msg}")
@@ -697,7 +864,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
     dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
     
-    if not force and len(files_to_process) == 0:
+    if not force and len(files_to_process) == 0 and not resume_state_changed:
         if os.path.exists(dataset_json_path) and os.path.exists(dataset_md_path):
             if enrich and enrich_ratio > 0:
                 print("Resuming: Q&A dataset is already complete and all files have been processed. Jumping directly to enrichment (Phase 5).")
@@ -710,12 +877,29 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     total_saved = 0
     if os.path.exists(raw_jsonl_path):
         with open(raw_jsonl_path, 'r', encoding='utf-8') as f:
-            total_saved = sum(1 for line in f if line.strip())
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                source_id = item.get("_source_file")
+                if (
+                    "question" in item
+                    and "answer" in item
+                    and item.get("_pipeline_fingerprint")
+                    == qa_pipeline_fingerprint
+                    and source_id in input_hashes
+                    and item.get("_input_sha256") == input_hashes[source_id]
+                ):
+                    total_saved += 1
 
     total_saved_before = total_saved  # snapshot to detect new pairs added by Phase 1
         
     if files_to_process:
-        print(f"Processing {len(files_to_process)} Markdown files for Q&A generation...")
+        print(
+            f"Processing {len(files_to_process)} {resolved_input_format} files "
+            "for Q&A generation..."
+        )
         if num_threads > 1:
             print(f"Using {num_threads} threads for parallel chunk processing.")
         
@@ -724,21 +908,34 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
              
         for input_path in pbar:
             filename = os.path.basename(input_path)
+            source_id = relative_source_id(input_path, source_dir)
             pbar.set_postfix({"file": filename[:20], "q_saved": total_saved})
             
             try:
-                with open(input_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-                    
-                if not text.strip():
+                input_chunks = _read_qa_input_chunks(
+                    input_path, resolved_input_format
+                )
+
+                if not input_chunks:
                     log_error(input_path, "File is empty.")
                     continue
-                    
-                # Split text into chunks to prevent context blowup while processing entire files
-                chunks = _split_into_chunks(text)
+                chunks = [item[0] for item in input_chunks]
+                provenance_by_idx = {
+                    index: item[1] for index, item in enumerate(input_chunks)
+                }
+                chunk_hashes = {
+                    index: hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+                    for index, chunk in enumerate(chunks)
+                }
+                input_sha256 = sha256_file(input_path)
                 
                 # Determine which chunks were already processed (chunk-level resume)
-                done_chunks = already_done.get(filename, set())
+                done_chunks = already_done.get(source_id, {})
+                if done_chunks and any(
+                    done_chunks.get(index) != chunk_hash
+                    for index, chunk_hash in chunk_hashes.items()
+                ):
+                    resume_state_changed = True
                 
                 file_count = 0
                 filtered_count = 0
@@ -761,9 +958,16 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                                 record = {
                                     "question": qa['question'],
                                     "answer": qa['answer'],
-                                    "_source_file": filename,
-                                    "_chunk_idx": chunk_idx
+                                    "_source_file": source_id,
+                                    "_chunk_idx": chunk_idx,
+                                    "_chunk_hash": chunk_hashes[chunk_idx],
+                                    "_input_sha256": input_sha256,
+                                    "_pipeline_fingerprint": qa_pipeline_fingerprint,
                                 }
+                                provenance = provenance_by_idx.get(chunk_idx, {})
+                                for key, value in provenance.items():
+                                    if value is not None:
+                                        record[f"_{key}"] = value
                                 f_raw.write(json.dumps(record, ensure_ascii=False) + "\n")
                                 file_count += 1
                                 total_saved += 1
@@ -775,7 +979,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                         for chunk_idx, chunk in enumerate(chunks):
                             if not chunk:
                                 continue
-                            if chunk_idx in done_chunks:
+                            if done_chunks.get(chunk_idx) == chunk_hashes[chunk_idx]:
                                 already_done_count += 1
                                 continue
                             if _is_junk_chunk(chunk):
@@ -814,7 +1018,7 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                             return
                         if not chunk:
                             continue
-                        if chunk_idx in done_chunks:
+                        if done_chunks.get(chunk_idx) == chunk_hashes[chunk_idx]:
                             already_done_count += 1
                             continue
                         if _is_junk_chunk(chunk):
@@ -838,12 +1042,24 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
                     if already_done_count > 0 and junk_chunks == 0:
                         # All chunks were already processed on a previous run — write sentinel silently
                         with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
-                            sentinel = {"_source_file": filename, "_chunk_idx": -1, "_skipped": False}
+                            sentinel = {
+                                "_source_file": source_id,
+                                "_chunk_idx": -1,
+                                "_input_sha256": input_sha256,
+                                "_pipeline_fingerprint": qa_pipeline_fingerprint,
+                                "_skipped": False,
+                            }
                             f_raw.write(json.dumps(sentinel, ensure_ascii=False) + "\n")
                     else:
                         # No chunks sent to LLM (all junk/empty) — mark as skipped
                         with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
-                            sentinel = {"_source_file": filename, "_chunk_idx": -1, "_skipped": True}
+                            sentinel = {
+                                "_source_file": source_id,
+                                "_chunk_idx": -1,
+                                "_input_sha256": input_sha256,
+                                "_pipeline_fingerprint": qa_pipeline_fingerprint,
+                                "_skipped": True,
+                            }
                             f_raw.write(json.dumps(sentinel, ensure_ascii=False) + "\n")
                         if junk_chunks > 0:
                             tqdm.write(f"  [{filename}] Skipped — all {junk_chunks} chunks are junk/garbage.")
@@ -882,8 +1098,13 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     dataset_json_path = os.path.join(dest_dir, "dataset_qa.json")
     dataset_md_path = os.path.join(dest_dir, "dataset_qa.md")
 
-    if new_pairs_count == 0 and os.path.exists(dataset_json_path) and os.path.exists(dataset_md_path):
-        print(f"\nNo new Q&A pairs generated. Final dataset already exists — skipping phases 2-4.")
+    if (
+        new_pairs_count == 0
+        and not resume_state_changed
+        and os.path.exists(dataset_json_path)
+        and os.path.exists(dataset_md_path)
+    ):
+        print("\nNo new Q&A pairs generated. Final dataset already exists — skipping phases 2-4.")
         # Jump directly to enrichment (Phase 5) if requested
         if enrich and enrich_ratio > 0:
             try:
@@ -914,7 +1135,11 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
             return
     
     # Load all raw pairs from disk for deduplication
-    all_qa_pairs = _load_raw_pairs(raw_jsonl_path)
+    all_qa_pairs = _load_raw_pairs(
+        raw_jsonl_path,
+        current_input_hashes=input_hashes,
+        pipeline_fingerprint=qa_pipeline_fingerprint,
+    )
     
     if not all_qa_pairs:
         print("ERROR: No Q&A pairs were generated at all! Check error.log for details.")
@@ -942,7 +1167,21 @@ def generate_qa_dataset(source_dir, dest_dir, model_name, llm_client=None, num_t
     print("Phase 4: Saving final clean files...")
     
     # Standard Alpaca json format (built before the with-block so it's available for enrichment)
-    alpaca_format = [{"instruction": qa["question"], "input": "", "output": qa["answer"]} for qa in unique_qa_pairs]
+    alpaca_format = []
+    for qa in unique_qa_pairs:
+        provenance = {
+            key[len("_source_") :]: value
+            for key, value in qa.items()
+            if key.startswith("_source_")
+        }
+        entry = {
+            "instruction": qa["question"],
+            "input": "",
+            "output": qa["answer"],
+        }
+        if provenance:
+            entry["_meta"] = {"source": provenance}
+        alpaca_format.append(entry)
 
     # Save JSON array
     with open(dataset_json_path, 'w', encoding='utf-8') as f_json:
@@ -1039,7 +1278,7 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
     indices = random.sample(non_enriched_indices, min(target_new_to_enrich, len(non_enriched_indices)))
 
     if not indices:
-        print(f"\nPhase 5: No more entries available to enrich. Skipping.")
+        print("\nPhase 5: No more entries available to enrich. Skipping.")
         return qa_list
 
     system_prompt = (
@@ -1087,11 +1326,18 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
                 )
                 result = _try_parse_enrichment_json(content)
                 if result and "input" in result and "output" in result:
+                    existing_meta = qa_list[idx].get("_meta", {})
+                    if not isinstance(existing_meta, dict):
+                        existing_meta = {}
                     qa_list[idx] = {
                         "instruction": inst,
                         "input": result["input"],
                         "output": result["output"] if isinstance(result["output"], str) else json.dumps(result["output"], ensure_ascii=False),
-                        "_meta": {"enriched": True, "model": model_name}
+                        "_meta": {
+                            **existing_meta,
+                            "enriched": True,
+                            "model": model_name,
+                        }
                     }
                     enriched_count += 1
                     
@@ -1228,5 +1474,3 @@ def prepare_hf_dataset(input_file, output_file=None):
     except Exception as e:
         print(f"❌ Erreur lors de la préparation HF pour '{input_file}': {e}")
         return None
-
-    return qa_list

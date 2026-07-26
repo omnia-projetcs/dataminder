@@ -1,0 +1,2 @@
+-r requirements.txt
+marker-pdf[full]>=2.0.0,<3

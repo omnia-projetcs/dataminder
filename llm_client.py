@@ -18,18 +18,31 @@ from requests.adapters import HTTPAdapter
 DEFAULT_TIMEOUT = 300   # 5 minutes
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 5  # seconds — retry delays: 5s, 10s, 20s
+DEFAULT_TEMPERATURE = 0.0
 
 
 class LLMClient:
     """Thread-safe LLM client that delegates to either Ollama or vLLM."""
 
-    def __init__(self, provider="ollama", vllm_url="http://localhost:8000", vllm_api_key="", timeout=None, ollama_url=None, max_pool_connections=32):
+    def __init__(
+        self,
+        provider="ollama",
+        vllm_url="http://localhost:8000",
+        vllm_api_key="",
+        timeout=None,
+        ollama_url=None,
+        max_pool_connections=32,
+        temperature=DEFAULT_TEMPERATURE,
+        seed=None,
+    ):
         self.provider = provider.lower()
         self.vllm_url = vllm_url.rstrip("/")
         self.vllm_api_key = vllm_api_key
         self.timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
         self.ollama_url = self._normalize_ollama_url(ollama_url)
         self.max_pool_connections = max_pool_connections
+        self.temperature = float(temperature)
+        self.seed = int(seed) if seed is not None else None
         self._thread_local = threading.local()
         self._vllm_endpoint = None  # "chat" or "completions"
         self._vllm_model = None     # auto-detected from /v1/models
@@ -37,6 +50,19 @@ class LLMClient:
 
         if self.provider not in ("ollama", "vllm"):
             raise ValueError(f"Unknown provider '{self.provider}'. Use 'ollama' or 'vllm'.")
+        if not 0.0 <= self.temperature <= 2.0:
+            raise ValueError("temperature must be between 0 and 2")
+
+    def generation_config(self):
+        """Return non-secret settings that affect generated output."""
+        return {
+            "provider": self.provider,
+            "endpoint": (
+                self.ollama_url if self.provider == "ollama" else self.vllm_url
+            ),
+            "temperature": self.temperature,
+            "seed": self.seed,
+        }
 
     def chat(self, model, messages, keep_alive=None):
         """
@@ -138,6 +164,9 @@ class LLMClient:
         }
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+        payload["options"] = {"temperature": self.temperature}
+        if self.seed is not None:
+            payload["options"]["seed"] = self.seed
 
         resp = self._session().post(
             f"{self.ollama_url}/api/chat",
@@ -210,11 +239,11 @@ class LLMClient:
             return
 
         if resp.status_code == 404:
-            print(f"[vLLM] /v1/chat/completions not found (404), switching to /v1/completions")
+            print("[vLLM] /v1/chat/completions not found (404), switching to /v1/completions")
             self._vllm_endpoint = "completions"
         else:
             self._vllm_endpoint = "chat"
-            print(f"[vLLM] Using endpoint: /v1/chat/completions")
+            print("[vLLM] Using endpoint: /v1/chat/completions")
 
     def _call_chat(self, model, messages, headers):
         """Call the OpenAI-compatible /v1/chat/completions endpoint."""
@@ -223,8 +252,10 @@ class LLMClient:
             "model": model,
             "messages": messages,
             "max_tokens": 8192,
-            "temperature": 0.7,
+            "temperature": self.temperature,
         }
+        if self.seed is not None:
+            payload["seed"] = self.seed
         resp = self._session().post(url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
@@ -238,8 +269,10 @@ class LLMClient:
             "model": model,
             "prompt": prompt,
             "max_tokens": 8192,
-            "temperature": 0.7,
+            "temperature": self.temperature,
         }
+        if self.seed is not None:
+            payload["seed"] = self.seed
         resp = self._session().post(url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
@@ -263,7 +296,15 @@ class LLMClient:
 
     def __repr__(self):
         if self.provider == "ollama":
-            return f"LLMClient(provider=ollama, url={self.ollama_url}, timeout={self.timeout}s)"
+            return (
+                f"LLMClient(provider=ollama, url={self.ollama_url}, "
+                f"temperature={self.temperature}, seed={self.seed}, "
+                f"timeout={self.timeout}s)"
+            )
         endpoint = self._vllm_endpoint or "auto"
         model = self._vllm_model or "auto"
-        return f"LLMClient(provider=vllm, url={self.vllm_url}, endpoint={endpoint}, model={model}, timeout={self.timeout}s)"
+        return (
+            f"LLMClient(provider=vllm, url={self.vllm_url}, endpoint={endpoint}, "
+            f"model={model}, temperature={self.temperature}, seed={self.seed}, "
+            f"timeout={self.timeout}s)"
+        )

@@ -1,0 +1,1 @@
+{"id":"html-layout","path":"fixtures/sample.html","required_phrases":["TLS 1.3","one round trip","obsolete cipher suites"],"forbidden_phrases":["navigation noise"],"min_chars":80,"expected_block_types":["text"],"reference_text":"fixtures/sample.reference.txt"}

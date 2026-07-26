@@ -1,8 +1,6 @@
 PyMuPDF
-pdf2image
 pytesseract
 python-docx
-ollama
 requests
 tqdm
 rarfile
@@ -15,4 +13,3 @@ EbookLib
 paddleocr
 faster-whisper
 paddlepaddle
-paddlepaddle-gpu
