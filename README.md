@@ -40,6 +40,15 @@ dataminder/
 │   │   ├── dataset_qa.md              # Human-readable Q&A pairs
 │   │   ├── dataset_qa_raw.jsonl       # Raw Q&A pairs before deduplication
 │   │   └── dataset_qa_enriched.json   # Enriched dataset for LLM fine-tuning
+│   ├── rag/             # Two standalone, source-grounded SQLite/FTS5 databases
+│   │   ├── cyber_rag.sqlite
+│   │   └── finance_rag.sqlite
+│   ├── model_enrichment/ # Filtered documentary continued-pretraining JSONL
+│   │   ├── cyber_model_enrichment.jsonl
+│   │   └── finance_model_enrichment.jsonl
+│   ├── model_enrichment_colab/ # Grounded chat records for the Colab notebook
+│   │   ├── cyber_colab_messages.jsonl
+│   │   └── finance_colab_messages.jsonl
 │   └── error.log        # Centralized error log
 ├── main.py              # Entry point
 ├── document_ir.py       # Structured document/block model and RAG chunker
@@ -169,6 +178,18 @@ Here are the most common commands you will need:
   ```bash
   python main.py --full
   ```
+- **Source-grounded model enrichment (recommended for domain adaptation):**
+  build separate Cyber and Finance RAG databases, filtered documentary corpora,
+  and Colab-compatible `messages` JSONL files without using generated summaries
+  or generated Q&A as factual sources:
+  ```bash
+  python main.py --build-model-data
+  ```
+  Build only one domain or override the original source directory:
+  ```bash
+  python main.py --build-model-data --model-data-domain cyber \
+    --cyber-source /path/to/original/cyber/documents
+  ```
 - **Custom Folders & Model:** Run extraction with a specific AI model and custom folders:
   ```bash
   python main.py --source ./my_files --dest ./my_summaries --model llama3
@@ -219,6 +240,27 @@ Here are the most common commands you will need:
   python main.py --enrich
   python main.py --enrich --enrich-ratio 0.5   # Enrich 50%
   ```
+
+### Conservative model-data pipeline
+
+`--build-model-data` is the deterministic path for RAG and domain adaptation.
+It reads the original documents directly and applies:
+
+- native-text extraction with explicit failure/no-text status;
+- SHA-256 document and chunk deduplication;
+- structural quality, minimum-length, front-matter, index, URL-list, and
+  corruption filters;
+- domain-specific exclusions discovered during corpus review;
+- per-document and normalized-title caps to limit single-source dominance;
+- exact provenance (source hash, page, section, parser, quality and rights
+  review status);
+- separate Cyber and Finance outputs at every stage;
+- grounded document-continuation conversations compatible with the included
+  Colab notebook.
+
+The legacy `--qa`, `--enrich`, and `--full` modes remain available for
+experiments involving LLM-generated Q&A. Their generated outputs should be
+audited before fine-tuning and are not consumed by `--build-model-data`.
 
 ### Detailed Commands
 

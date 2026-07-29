@@ -7,6 +7,7 @@ import json
 import time
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from document_ir import build_chunks, chunks_to_jsonl, sha256_file
 from document_parser import extract_document
 from extractor import (
@@ -315,7 +316,131 @@ def _summarize_chunk_timed(chunk, model_name, level, llm_client):
     return result, elapsed
 
 
+def build_model_data_products(
+    *,
+    cyber_source,
+    finance_source,
+    rag_dir,
+    training_dir,
+    colab_dir,
+    domain="both",
+    chunk_max_chars=3200,
+    chunk_overlap_chars=320,
+    min_quality=0.80,
+    min_training_chars=400,
+    min_training_words=50,
+    max_chunks_per_document=600,
+):
+    """Build conservative RAG and model-enrichment products from originals.
+
+    This path is deliberately independent from the summarization/Q&A pipeline:
+    generated summaries are never used as factual training sources.
+    """
+    from scripts.build_rag_databases import build_database
+    from scripts.export_colab_messages import convert_file
+    from scripts.export_model_enrichment import export_database
+
+    if domain not in {"both", "cyber", "finance"}:
+        raise ValueError("domain must be one of: both, cyber, finance")
+    if chunk_max_chars < 200:
+        raise ValueError("chunk_max_chars must be at least 200")
+    if not 0 <= chunk_overlap_chars < chunk_max_chars:
+        raise ValueError(
+            "chunk_overlap_chars must be non-negative and smaller than "
+            "chunk_max_chars"
+        )
+    if not 0 <= min_quality <= 1:
+        raise ValueError("min_quality must be between 0 and 1")
+    if min_training_chars < 400:
+        raise ValueError(
+            "min_training_chars must be at least 400 for grounded Colab "
+            "continuations"
+        )
+    if min_training_words < 30:
+        raise ValueError("min_training_words must be at least 30")
+    if max_chunks_per_document < 1:
+        raise ValueError("max_chunks_per_document must be positive")
+
+    source_paths = {
+        "cyber": Path(cyber_source),
+        "finance": Path(finance_source),
+    }
+    rag_dir = Path(rag_dir)
+    training_dir = Path(training_dir)
+    colab_dir = Path(colab_dir)
+    selected_domains = (
+        ("cyber", "finance") if domain == "both" else (domain,)
+    )
+
+    report = {
+        "schema_version": 1,
+        "pipeline": "source-grounded-model-data",
+        "policies": {
+            "source": "original_documents_only",
+            "generated_summaries": "excluded",
+            "generated_qa": "excluded",
+            "ocr": "native_text_only",
+            "document_deduplication": "sha256",
+            "chunk_deduplication": "canonical_sha256",
+            "rights_status": "unknown_review_required",
+        },
+        "domains": {},
+    }
+
+    for selected_domain in selected_domains:
+        source_root = source_paths[selected_domain]
+        if not source_root.is_dir():
+            raise FileNotFoundError(
+                f"{selected_domain} source directory not found: {source_root}"
+            )
+
+        rag_path = rag_dir / f"{selected_domain}_rag.sqlite"
+        training_path = (
+            training_dir / f"{selected_domain}_model_enrichment.jsonl"
+        )
+        colab_path = (
+            colab_dir / f"{selected_domain}_colab_messages.jsonl"
+        )
+        print(
+            f"\n[{selected_domain}] Building RAG database from originals: "
+            f"{source_root}"
+        )
+        rag_report = build_database(
+            domain=selected_domain,
+            source_root=source_root,
+            output_path=rag_path,
+            max_chars=chunk_max_chars,
+            overlap_chars=chunk_overlap_chars,
+        )
+
+        print(f"[{selected_domain}] Exporting filtered model corpus")
+        training_report = export_database(
+            database=rag_path,
+            output=training_path,
+            expected_domain=selected_domain,
+            min_quality=min_quality,
+            min_chars=min_training_chars,
+            min_words=min_training_words,
+            max_chunks_per_document=max_chunks_per_document,
+        )
+
+        print(f"[{selected_domain}] Exporting grounded Colab conversations")
+        colab_report = convert_file(
+            source=training_path,
+            output=colab_path,
+            expected_domain=selected_domain,
+        )
+        report["domains"][selected_domain] = {
+            "rag": rag_report,
+            "training": training_report,
+            "colab": colab_report,
+        }
+
+    return report
+
+
 if __name__ == "__main__":
+    project_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
     parser.add_argument("--source", default=os.path.join("data", "source"), help="Source directory containing the documents to process (default: data/source).")
     parser.add_argument("--dest", default=os.path.join("data", "export"), help="Destination directory for the Markdown summaries (default: data/export).")
@@ -324,7 +449,89 @@ if __name__ == "__main__":
     parser.add_argument("--qa", action="store_true", help="Enable QA Dataset Generation mode (reads RAG chunks when available, otherwise Markdown summaries).")
     parser.add_argument("--full", action="store_true", help="Run the full pipeline: Document summarization followed by QA Dataset generation.")
     parser.add_argument("--enrich", action="store_true", help="Run enrichment only on an existing dataset_qa.json in data/results/.")
+    parser.add_argument(
+        "--build-model-data",
+        action="store_true",
+        help=(
+            "Build source-grounded RAG, documentary training, and Colab "
+            "datasets without generated summaries or Q&A."
+        ),
+    )
     parser.add_argument("--force", action="store_true", help="Force reprocessing of all files, ignoring resume state.")
+
+    # Conservative model-data pipeline
+    parser.add_argument(
+        "--model-data-domain",
+        default="both",
+        choices=["both", "cyber", "finance"],
+        help="Domain(s) to build with --build-model-data (default: both).",
+    )
+    parser.add_argument(
+        "--cyber-source",
+        default=str(project_root / "data" / "source" / "00_DATA_SOURCE_LLM"),
+        help="Original Cyber source directory.",
+    )
+    parser.add_argument(
+        "--finance-source",
+        default=str(
+            project_root.parent / "DATASETS" / "FINANCE" / "FINANCE_DOCS"
+        ),
+        help="Original Finance source directory.",
+    )
+    parser.add_argument(
+        "--rag-dir",
+        default=str(project_root / "data" / "rag"),
+        help="Directory for the two SQLite RAG databases.",
+    )
+    parser.add_argument(
+        "--training-dir",
+        default=str(project_root / "data" / "model_enrichment"),
+        help="Directory for filtered documentary training JSONL files.",
+    )
+    parser.add_argument(
+        "--colab-dir",
+        default=str(project_root / "data" / "model_enrichment_colab"),
+        help="Directory for Colab-compatible messages JSONL files.",
+    )
+    parser.add_argument(
+        "--rag-max-chars",
+        type=int,
+        default=3200,
+        help="Maximum RAG chunk size in characters (default: 3200).",
+    )
+    parser.add_argument(
+        "--rag-overlap-chars",
+        type=int,
+        default=320,
+        help="RAG chunk overlap in characters (default: 320).",
+    )
+    parser.add_argument(
+        "--training-min-quality",
+        type=float,
+        default=0.80,
+        help="Minimum structural quality score for training (default: 0.80).",
+    )
+    parser.add_argument(
+        "--training-min-chars",
+        type=int,
+        default=400,
+        help="Minimum training example size in characters (default: 400).",
+    )
+    parser.add_argument(
+        "--training-min-words",
+        type=int,
+        default=50,
+        help="Minimum training example word count (default: 50).",
+    )
+    parser.add_argument(
+        "--max-chunks-per-document",
+        type=int,
+        default=600,
+        help=(
+            "Maximum examples per document and normalized title to limit "
+            "single-source dominance (default: 600)."
+        ),
+    )
 
     # Document parser options
     parser.add_argument(
@@ -393,6 +600,48 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+
+    selected_modes = sum(
+        bool(mode)
+        for mode in (
+            args.full,
+            args.qa,
+            args.enrich,
+            args.build_model_data,
+        )
+    )
+    if selected_modes > 1:
+        parser.error(
+            "--full, --qa, --enrich, and --build-model-data are mutually "
+            "exclusive"
+        )
+
+    if args.build_model_data:
+        print("--- Starting source-grounded model-data pipeline ---")
+        model_data_report = build_model_data_products(
+            cyber_source=args.cyber_source,
+            finance_source=args.finance_source,
+            rag_dir=args.rag_dir,
+            training_dir=args.training_dir,
+            colab_dir=args.colab_dir,
+            domain=args.model_data_domain,
+            chunk_max_chars=args.rag_max_chars,
+            chunk_overlap_chars=args.rag_overlap_chars,
+            min_quality=args.training_min_quality,
+            min_training_chars=args.training_min_chars,
+            min_training_words=args.training_min_words,
+            max_chunks_per_document=args.max_chunks_per_document,
+        )
+        print(json.dumps(model_data_report, ensure_ascii=False, indent=2))
+        print("\n--- Source-grounded model-data pipeline complete ---")
+        raise SystemExit(0)
+
+    if args.full or args.qa or args.enrich:
+        print(
+            "WARNING: this legacy mode creates or transforms LLM-generated "
+            "Q&A. Audit its output before training. Use --build-model-data "
+            "for the source-grounded deterministic pipeline."
+        )
     
     # Build the LLM client
     llm_client = LLMClient(
