@@ -1,5 +1,0 @@
-Transport security
-
-TLS 1.3 removes obsolete cipher suites.
-
-Its standard handshake completes in one round trip.
