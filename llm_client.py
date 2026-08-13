@@ -44,6 +44,9 @@ class LLMClient:
         self.temperature = float(temperature)
         self.seed = int(seed) if seed is not None else None
         self._thread_local = threading.local()
+        self._sessions = []
+        self._sessions_lock = threading.Lock()
+        self._session_generation = 0
         self._vllm_endpoint = None  # "chat" or "completions"
         self._vllm_model = None     # auto-detected from /v1/models
         self._detect_lock = threading.Lock()
@@ -96,6 +99,19 @@ class LLMClient:
                     time.sleep(delay)
                 else:
                     print(f"  [TIMEOUT] LLM call timed out after {self.timeout}s (attempt {attempt}/{MAX_RETRIES}). Giving up.")
+            except requests.HTTPError as e:
+                last_error = e
+                status = getattr(e.response, "status_code", None)
+                # Client errors other than rate-limits will not succeed on retry.
+                if status is not None and 400 <= status < 500 and status != 429:
+                    print(f"  [HTTP {status}] LLM call failed permanently: {e}")
+                    raise
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    print(f"  [RETRY] LLM HTTP {status or 'error'}: {e} (attempt {attempt}/{MAX_RETRIES}). Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    print(f"  [RETRY] LLM HTTP {status or 'error'}: {e} (attempt {attempt}/{MAX_RETRIES}). Giving up.")
             except Exception as e:
                 last_error = e
                 if attempt < MAX_RETRIES:
@@ -108,19 +124,33 @@ class LLMClient:
         raise last_error
 
     def unload_model(self, model):
-        """Unload the model from VRAM. Only relevant for Ollama."""
-        if self.provider != "ollama":
-            return
-        try:
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": "."}],
-                "keep_alive": 0,
-                "stream": False,
-            }
-            self._session().post(f"{self.ollama_url}/api/chat", json=payload, timeout=30)
-        except Exception:
-            pass
+        """Unload the model from VRAM (Ollama) and close pooled HTTP sessions."""
+        if self.provider == "ollama":
+            try:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "."}],
+                    "keep_alive": 0,
+                    "stream": False,
+                }
+                self._session().post(f"{self.ollama_url}/api/chat", json=payload, timeout=30)
+            except Exception:
+                pass
+        self.close()
+
+    def close(self):
+        """Close every thread-local HTTP session created by this client."""
+        with self._sessions_lock:
+            sessions = self._sessions
+            self._sessions = []
+            self._session_generation += 1
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
+        self._thread_local.session = None
+        self._thread_local.generation = None
 
     @staticmethod
     def _normalize_ollama_url(ollama_url):
@@ -138,8 +168,9 @@ class LLMClient:
         thread gets its own session while still benefiting from HTTP keep-alive
         and adapter-level connection pooling.
         """
+        generation = self._session_generation
         session = getattr(self._thread_local, "session", None)
-        if session is None:
+        if session is None or getattr(self._thread_local, "generation", None) != generation:
             session = requests.Session()
             adapter = HTTPAdapter(
                 pool_connections=self.max_pool_connections,
@@ -148,6 +179,9 @@ class LLMClient:
             session.mount("http://", adapter)
             session.mount("https://", adapter)
             self._thread_local.session = session
+            self._thread_local.generation = generation
+            with self._sessions_lock:
+                self._sessions.append(session)
         return session
 
     def _chat_ollama(self, model, messages, keep_alive):
@@ -187,11 +221,12 @@ class LLMClient:
             with self._detect_lock:
                 # Double-check after acquiring lock
                 if self._vllm_endpoint is None:
-                    self._detect_model(headers)
-                    self._detect_endpoint(self._vllm_model or model, headers)
+                    if not model:
+                        self._detect_model(headers)
+                    self._detect_endpoint(model or self._vllm_model or "default", headers)
 
-        # Use auto-detected model if available
-        resolved_model = self._vllm_model or model
+        # Honour --model. Auto-detect only when the caller did not name one.
+        resolved_model = model or self._vllm_model
 
         # Use the detected endpoint
         if self._vllm_endpoint == "completions":

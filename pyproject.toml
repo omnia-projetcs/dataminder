@@ -57,6 +57,7 @@ dataminder-benchmark = "benchmark:main"
 [tool.setuptools]
 py-modules = [
     "benchmark",
+    "dataset_export",
     "document_ir",
     "document_parser",
     "extractor",

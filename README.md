@@ -57,7 +57,6 @@ dataminder/
 ├── processing_manifest.py # Atomic outputs and content-aware resume state
 ├── run_report.py        # Per-run metrics and document outcomes
 ├── benchmark.py         # Parser quality benchmark and regression gate
-├── benchmarks/          # Example corpus and benchmark documentation
 ├── extractor.py         # Text extraction from all formats
 ├── summarizer.py        # AI summarization via LLM
 ├── qa_generator.py      # Q&A dataset generation & enrichment
@@ -328,25 +327,19 @@ define required and forbidden phrases, minimum output length, expected pages
 and block types, plus an optional reference transcription.
 
 ```bash
-# Native regression gate
-python benchmark.py \
-  --corpus benchmarks/corpus.example.jsonl \
-  --parsers native \
-  --min-score 0.90 \
-  --output benchmark-report.json
-
-# Compare local backends after installing Marker
+# Compare local backends against a private corpus manifest
 python benchmark.py \
   --corpus /path/to/private-corpus.jsonl \
   --parsers native,marker,auto \
   --marker-mode fast \
+  --min-score 0.90 \
   --output benchmark-report.json
 ```
 
-The report contains per-document component scores, extraction time,
-character/block/chunk counts, diagnostics, and a summary for each parser. See
-`benchmarks/README.md` for the corpus schema. The native quality gate also runs
-in CI on Python 3.10, 3.11, and 3.12.
+Each JSONL case can declare required and forbidden phrases, a minimum length,
+expected pages or block types, and an optional reference transcription. The
+report contains per-document component scores, extraction time,
+character/block/chunk counts, diagnostics, and a summary for each parser.
 
 ## Q&A Dataset Generation
 
@@ -470,6 +463,7 @@ python main.py --qa --provider vllm --vllm-url http://my-server:8000 --model my-
 | `--seed` | *(unset)* | Optional generation seed forwarded to Ollama/vLLM |
 | `--report` | `DEST/.dataminder-last-run.json` | Document-processing run report path |
 | `--enrich-ratio` | `0.3` | Fraction of deduplicated pairs to enrich (0 = skip, 1.0 = all). Used with `--full` or `--enrich` |
+| `--enrich-domain` | `cyber` | Enrichment prompt: `cyber` (MITRE/CVSS/IOC), `finance`, or `generic` |
 | `--qa-source` | `auto` | Q&A input: prefer `chunks`, require `chunks`, or use `summaries` |
 | `--ocr-engine` | `tesseract` | OCR engine: `tesseract` (legacy, default) or `paddleocr` (PP-OCRv5, deep learning) |
 | `--paddleocr` | *(flag)* | Enable PaddleOCR PP-OCRv5 (deep learning) instead of Tesseract |

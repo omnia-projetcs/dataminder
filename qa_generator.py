@@ -4,6 +4,7 @@ import re
 import hashlib
 import signal
 import sys
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -13,7 +14,8 @@ import random
 from llm_client import LLMClient
 from logger import log_error as _log_error
 from document_ir import sha256_file
-from processing_manifest import relative_source_id, stable_fingerprint
+from processing_manifest import atomic_write_text, relative_source_id, stable_fingerprint
+from dataset_export import clean_dataset, prepare_hf_dataset
 
 
 CHUNK_SIZE = 5000
@@ -36,8 +38,17 @@ def _signal_handler(signum, frame):
         sys.exit(1)
 
 
-signal.signal(signal.SIGTERM, _signal_handler)
-signal.signal(signal.SIGINT, _signal_handler)
+def _install_shutdown_handlers():
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, _signal_handler)
+    return previous
+
+
+def _restore_shutdown_handlers(previous):
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
 
 
 def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
@@ -190,6 +201,8 @@ def _sanitize_json_string(raw_json):
                 result.append('\\r')
             elif ch == '\t':
                 result.append('\\t')
+            elif ord(ch) < 32:
+                result.append(f'\\u{ord(ch):04x}')
             else:
                 result.append(ch)
         else:
@@ -198,6 +211,32 @@ def _sanitize_json_string(raw_json):
         i += 1
     
     return ''.join(result)
+
+
+def _extract_balanced_json_array(content):
+    """Return the first top-level JSON array, ignoring brackets inside strings."""
+    start = content.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    i = start
+    while i < len(content):
+        ch = content[i]
+        if ch == "\\" and in_str:
+            i += 2
+            continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return content[start : i + 1]
+        i += 1
+    return None
 
 
 def _try_parse_json(content):
@@ -213,10 +252,9 @@ def _try_parse_json(content):
         except json.JSONDecodeError:
             pass
     
-    # Strategy 2: Find the outermost [...] array
-    match = re.search(r'\[.*\]', content, re.DOTALL)
-    if match:
-        json_str = match.group(0)
+    # Strategy 2: First balanced [...] array (avoids swallowing later brackets)
+    json_str = _extract_balanced_json_array(content)
+    if json_str:
         sanitized = _sanitize_json_string(json_str)
         try:
             return json.loads(sanitized)
@@ -756,6 +794,40 @@ def generate_qa_dataset(
     enrich=False,
     enrich_ratio=0.3,
     input_format="auto",
+    enrich_domain="cyber",
+):
+    """Generate a Q&A dataset, installing shutdown handlers only for this run."""
+    global _shutdown_requested
+    _shutdown_requested = False
+    previous_handlers = _install_shutdown_handlers()
+    try:
+        return _run_qa_dataset(
+            source_dir,
+            dest_dir,
+            model_name,
+            llm_client=llm_client,
+            num_threads=num_threads,
+            force=force,
+            enrich=enrich,
+            enrich_ratio=enrich_ratio,
+            input_format=input_format,
+            enrich_domain=enrich_domain,
+        )
+    finally:
+        _restore_shutdown_handlers(previous_handlers)
+
+
+def _run_qa_dataset(
+    source_dir,
+    dest_dir,
+    model_name,
+    llm_client=None,
+    num_threads=1,
+    force=False,
+    enrich=False,
+    enrich_ratio=0.3,
+    input_format="auto",
+    enrich_domain="cyber",
 ):
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
@@ -904,6 +976,7 @@ def generate_qa_dataset(
             print(f"Using {num_threads} threads for parallel chunk processing.")
         
         failed_files = 0
+        raw_write_lock = threading.Lock()
         pbar = tqdm(files_to_process, desc="Generating Q&A", unit="file")
              
         for input_path in pbar:
@@ -949,28 +1022,29 @@ def generate_qa_dataset(
                     nonlocal file_count, filtered_count, total_saved
                     if not isinstance(chunk_pairs, list):
                         return
-                    with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
-                        for qa in chunk_pairs:
-                            if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
-                                if _references_source_material(qa):
-                                    filtered_count += 1
-                                    continue
-                                record = {
-                                    "question": qa['question'],
-                                    "answer": qa['answer'],
-                                    "_source_file": source_id,
-                                    "_chunk_idx": chunk_idx,
-                                    "_chunk_hash": chunk_hashes[chunk_idx],
-                                    "_input_sha256": input_sha256,
-                                    "_pipeline_fingerprint": qa_pipeline_fingerprint,
-                                }
-                                provenance = provenance_by_idx.get(chunk_idx, {})
-                                for key, value in provenance.items():
-                                    if value is not None:
-                                        record[f"_{key}"] = value
-                                f_raw.write(json.dumps(record, ensure_ascii=False) + "\n")
-                                file_count += 1
-                                total_saved += 1
+                    with raw_write_lock:
+                        with open(raw_jsonl_path, 'a', encoding='utf-8') as f_raw:
+                            for qa in chunk_pairs:
+                                if isinstance(qa, dict) and 'question' in qa and 'answer' in qa:
+                                    if _references_source_material(qa):
+                                        filtered_count += 1
+                                        continue
+                                    record = {
+                                        "question": qa['question'],
+                                        "answer": qa['answer'],
+                                        "_source_file": source_id,
+                                        "_chunk_idx": chunk_idx,
+                                        "_chunk_hash": chunk_hashes[chunk_idx],
+                                        "_input_sha256": input_sha256,
+                                        "_pipeline_fingerprint": qa_pipeline_fingerprint,
+                                    }
+                                    provenance = provenance_by_idx.get(chunk_idx, {})
+                                    for key, value in provenance.items():
+                                        if value is not None:
+                                            record[f"_{key}"] = value
+                                    f_raw.write(json.dumps(record, ensure_ascii=False) + "\n")
+                                    file_count += 1
+                                    total_saved += 1
 
                 if num_threads > 1 and len(chunks) > 1:
                     # Parallel chunk processing — flush per chunk as results arrive
@@ -1112,9 +1186,11 @@ def generate_qa_dataset(
                     alpaca_format = json.load(f_json)
                 print(f"Loaded {len(alpaca_format)} entries from existing dataset for enrichment.")
                 dataset_enriched_path = os.path.join(dest_dir, "dataset_qa_enriched.json")
-                enriched_pairs = _enrich_after_dedup(list(alpaca_format), ratio=enrich_ratio, model_name=model_name, llm_client=llm_client, output_path=dataset_enriched_path)
-                with open(dataset_enriched_path, 'w', encoding='utf-8') as f_enriched:
-                    json.dump(enriched_pairs, f_enriched, ensure_ascii=False, indent=2)
+                enriched_pairs = _enrich_after_dedup(list(alpaca_format), ratio=enrich_ratio, model_name=model_name, llm_client=llm_client, output_path=dataset_enriched_path, domain=enrich_domain)
+                atomic_write_text(
+                    dataset_enriched_path,
+                    json.dumps(enriched_pairs, ensure_ascii=False, indent=2) + "\n",
+                )
                 enriched_count = sum(1 for e in enriched_pairs if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
                 print(f"Saved enriched dataset ({enriched_count} entries enriched) to: {dataset_enriched_path}")
                 clean_dataset(dataset_json_path)
@@ -1183,17 +1259,16 @@ def generate_qa_dataset(
             entry["_meta"] = {"source": provenance}
         alpaca_format.append(entry)
 
-    # Save JSON array
-    with open(dataset_json_path, 'w', encoding='utf-8') as f_json:
-        json.dump(alpaca_format, f_json, ensure_ascii=False, indent=2)
-        
-    # Save Markdown
-    with open(dataset_md_path, 'w', encoding='utf-8') as f_md:
-        f_md.write("# QA Dataset\n\n")
-        for qa in unique_qa_pairs:
-            f_md.write(f"**Q: {qa['question']}**\n\n")
-            f_md.write(f"**A:** {qa['answer']}\n\n")
-            f_md.write("---\n\n")
+    atomic_write_text(
+        dataset_json_path,
+        json.dumps(alpaca_format, ensure_ascii=False, indent=2) + "\n",
+    )
+    markdown_parts = ["# QA Dataset\n\n"]
+    for qa in unique_qa_pairs:
+        markdown_parts.append(f"**Q: {qa['question']}**\n\n")
+        markdown_parts.append(f"**A:** {qa['answer']}\n\n")
+        markdown_parts.append("---\n\n")
+    atomic_write_text(dataset_md_path, "".join(markdown_parts))
 
     print(f"\nQ&A Generation Complete! Generated {len(unique_qa_pairs)} unique Q&A pairs (Removed {len(all_qa_pairs) - len(unique_qa_pairs)} duplicates).")
     print(f"Saved JSON dataset to: {dataset_json_path}")
@@ -1206,10 +1281,12 @@ def generate_qa_dataset(
     # Phase 5: Post-deduplication enrichment (only in full pipeline mode)
     if enrich and enrich_ratio > 0:
         dataset_enriched_path = os.path.join(dest_dir, "dataset_qa_enriched.json")
-        enriched_pairs = _enrich_after_dedup(list(alpaca_format), ratio=enrich_ratio, model_name=model_name, llm_client=llm_client, output_path=dataset_enriched_path)
+        enriched_pairs = _enrich_after_dedup(list(alpaca_format), ratio=enrich_ratio, model_name=model_name, llm_client=llm_client, output_path=dataset_enriched_path, domain=enrich_domain)
         # Final save (also done incrementally inside the function for crash safety)
-        with open(dataset_enriched_path, 'w', encoding='utf-8') as f_enriched:
-            json.dump(enriched_pairs, f_enriched, ensure_ascii=False, indent=2)
+        atomic_write_text(
+            dataset_enriched_path,
+            json.dumps(enriched_pairs, ensure_ascii=False, indent=2) + "\n",
+        )
         enriched_count = sum(1 for e in enriched_pairs if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
         print(f"Saved enriched dataset ({enriched_count} entries enriched) to: {dataset_enriched_path}")
         cleaned_enriched = clean_dataset(dataset_enriched_path)
@@ -1227,7 +1304,34 @@ def generate_qa_dataset(
     llm_client.unload_model(model_name)
 
 
-def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", llm_client=None, output_path=None):
+_ENRICHMENT_PROMPTS = {
+    "cyber": (
+        "You are a cybersecurity expert. Transform the provided Q&A into a structured report. "
+        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
+        "\"input\" = credible technical context (logs, tool output, scenario). "
+        "\"output\" = structured report with: summary, MITRE ATT&CK (TXXXX), CVSS, recommendations, IOC. "
+        "No markdown, no explanation, no code fences — just the raw JSON object."
+    ),
+    "finance": (
+        "You are a finance and markets expert. Transform the provided Q&A into a structured report. "
+        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
+        "\"input\" = credible financial context (market data, filings, or a scenario). "
+        "\"output\" = structured report with: summary, instruments or metrics, risk factors, "
+        "regulatory notes only when implied by the Q&A, and recommendations. "
+        "Do not invent tickers, prices, or regulations. "
+        "No markdown, no explanation, no code fences — just the raw JSON object."
+    ),
+    "generic": (
+        "You are a technical expert. Transform the provided Q&A into a structured report. "
+        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
+        "\"input\" = realistic technical context. "
+        "\"output\" = structured report with: summary, key facts, constraints, and recommendations. "
+        "No markdown, no explanation, no code fences — just the raw JSON object."
+    ),
+}
+
+
+def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", llm_client=None, output_path=None, domain="cyber"):
     """Enrich a fraction of the deduplicated dataset just before saving.
 
     Uses the shared LLMClient abstraction so enrichment works with both
@@ -1242,6 +1346,8 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
 
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
+    if domain not in _ENRICHMENT_PROMPTS:
+        raise ValueError("domain must be one of: cyber, finance, generic")
 
     # Resume: load existing enriched data if available
     already_enriched_count = 0
@@ -1275,19 +1381,14 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
     ]
 
     # Sample exactly what is needed to reach the target ratio
-    indices = random.sample(non_enriched_indices, min(target_new_to_enrich, len(non_enriched_indices)))
+    rng = random.Random(getattr(llm_client, "seed", None))
+    indices = rng.sample(non_enriched_indices, min(target_new_to_enrich, len(non_enriched_indices)))
 
     if not indices:
         print("\nPhase 5: No more entries available to enrich. Skipping.")
         return qa_list
 
-    system_prompt = (
-        "You are a cybersecurity expert. Transform the provided Q&A into a structured report. "
-        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
-        "\"input\" = credible technical context (logs, tool output, scenario). "
-        "\"output\" = structured report with: summary, MITRE ATT&CK (TXXXX), CVSS, recommendations, IOC. "
-        "No markdown, no explanation, no code fences — just the raw JSON object."
-    )
+    system_prompt = _ENRICHMENT_PROMPTS[domain]
 
     total_target = already_enriched_count + len(indices)
     print(f"\nPhase 5: Post-deduplication enrichment: {len(indices)} remaining / {total_target} target ({ratio*100:.0f}%)...")
@@ -1296,12 +1397,11 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
     
     def _save_progress():
         if output_path:
-            temp_output_path = output_path + ".tmp"
             try:
-                # Write to temp file first then atomically replace to avoid corruption
-                with open(temp_output_path, 'w', encoding='utf-8') as f_save:
-                    json.dump(qa_list, f_save, ensure_ascii=False, indent=2)
-                os.replace(temp_output_path, output_path)
+                atomic_write_text(
+                    output_path,
+                    json.dumps(qa_list, ensure_ascii=False, indent=2) + "\n",
+                )
             except Exception as save_err:
                 tqdm.write(f"  [WARNING] Failed to save progress: {save_err}")
 
@@ -1337,6 +1437,7 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
                             **existing_meta,
                             "enriched": True,
                             "model": model_name,
+                            "domain": domain,
                         }
                     }
                     enriched_count += 1
@@ -1357,120 +1458,6 @@ def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", ll
 
     final_total = sum(1 for e in qa_list if isinstance(e, dict) and isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
     print(f"  Enrichment complete. {enriched_count} new + {already_enriched_count} resumed = {final_total} total enriched.\n")
+    return qa_list
 
 
-def clean_dataset(data_or_filepath, output_file=None):
-    """
-    Lit un fichier JSON ou une liste d'objets (avec instruction, input, output),
-    nettoie et valide les entrées, puis écrit un fichier JSONL (un objet JSON par ligne).
-    """
-    data = None
-    input_desc = ""
-
-    if isinstance(data_or_filepath, str):
-        input_file = data_or_filepath
-        if not os.path.exists(input_file):
-            print(f"⚠️ Fichier introuvable pour le nettoyage : {input_file}")
-            return None
-        input_desc = input_file
-        if output_file is None:
-            if input_file.endswith(".json"):
-                output_file = input_file[:-5] + "_cleaned.json"
-            else:
-                output_file = f"{input_file}_cleaned.json"
-        try:
-            with open(input_file, "r", encoding="utf-8") as infile:
-                data = json.load(infile)
-        except Exception as e:
-            print(f"❌ Erreur lors de la lecture de '{input_file}': {e}")
-            return None
-    elif isinstance(data_or_filepath, list):
-        data = data_or_filepath
-        input_desc = "liste en mémoire"
-        if output_file is None:
-            output_file = "dataset_cleaned.json"
-    else:
-        print(f"⚠️ Type de données invalide pour clean_dataset: {type(data_or_filepath)}")
-        return None
-
-    if not isinstance(data, list):
-        print(f"⚠️ Format inattendu dans '{input_desc}': attendu une liste JSON.")
-        return None
-
-    valides = 0
-    print(f"Nettoyage du jeu de données '{input_desc}' -> '{output_file}'...")
-
-    try:
-        with open(output_file, "w", encoding="utf-8") as outfile:
-            for item in data:
-                if isinstance(item, dict):
-                    instruction = str(item.get("instruction") or "").strip()
-                    output = str(item.get("output") or "").strip()
-                    input_val = str(item.get("input") or "").strip()
-
-                    if instruction and output:
-                        clean_entry = {
-                            "instruction": instruction,
-                            "input": input_val,
-                            "output": output
-                        }
-                        outfile.write(json.dumps(clean_entry, ensure_ascii=False) + "\n")
-                        valides += 1
-
-        print(f"✅ Terminé ! {valides} lignes valides enregistrées dans '{output_file}'")
-        return output_file
-    except Exception as e:
-        print(f"❌ Erreur lors du nettoyage de '{input_desc}': {e}")
-        return None
-
-
-def prepare_hf_dataset(input_file, output_file=None):
-    """
-    Transforme un fichier de jeu de données nettoyé (JSONL avec instruction, input, output)
-    en un fichier au format Hugging Face AutoTrain / fine-tuning (JSONL avec clé "text").
-    """
-    if not os.path.exists(input_file):
-        print(f"⚠️ Fichier introuvable pour la préparation HF : {input_file}")
-        return None
-
-    if output_file is None:
-        if input_file.endswith(".json") or input_file.endswith(".jsonl"):
-            base = os.path.splitext(input_file)[0]
-            output_file = f"{base}_hf.jsonl"
-        else:
-            output_file = f"{input_file}_hf.jsonl"
-
-    count = 0
-    print(f"Préparation de l'export Hugging Face '{input_file}' -> '{output_file}'...")
-
-    try:
-        with open(input_file, "r", encoding="utf-8") as infile, open(output_file, "w", encoding="utf-8") as outfile:
-            for line in infile:
-                line_str = line.strip()
-                if not line_str:
-                    continue
-                try:
-                    data = json.loads(line_str)
-
-                    inst = data.get("instruction", "").strip()
-                    inp = data.get("input", "").strip()
-                    out = data.get("output", "").strip()
-
-                    if not inst or not out:
-                        continue
-
-                    if inp:
-                        full_text = f"### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n{out}"
-                    else:
-                        full_text = f"### Instruction:\n{inst}\n\n### Response:\n{out}"
-
-                    outfile.write(json.dumps({"text": full_text}, ensure_ascii=False) + "\n")
-                    count += 1
-                except Exception:
-                    continue
-
-        print(f"✅ Fichier Hugging Face '{output_file}' généré avec succès ({count} exemples).")
-        return output_file
-    except Exception as e:
-        print(f"❌ Erreur lors de la préparation HF pour '{input_file}': {e}")
-        return None

@@ -11,11 +11,11 @@ from pathlib import Path
 from document_ir import build_chunks, chunks_to_jsonl, sha256_file
 from document_parser import extract_document
 from extractor import (
+    SUPPORTED_EXTENSIONS,
     configure_ocr,
     configure_whisper,
     extraction_config,
 )
-from transcriber import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 from summarizer import SUMMARY_PROMPT_REVISION, summarize_text
 from llm_client import LLMClient
 from logger import log_error as _log_error
@@ -77,21 +77,17 @@ def process_documents(
     print(f"Scanning '{source_dir}' recursively...")
     
     files_to_process = []
-    supported_exts = {
-        '.txt', '.md', '.rst', '.docx', '.pdf', '.cbz', '.cbr',
-        '.doc', '.pptx', '.xls', '.xlsx', '.html', '.htm', '.chm',
-        '.epub', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'
-    } | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
     for root, _, files in os.walk(source_dir):
         for file in files:
             ext = os.path.splitext(file)[1].lower()
-            if ext in supported_exts:
+            if ext in SUPPORTED_EXTENSIONS:
                 files_to_process.append(os.path.join(root, file))
     files_to_process.sort()
     
     if not files_to_process:
         print(f"No supported documents found in '{source_dir}'.")
-        print("Supported: txt, md, rst, pdf, doc, docx, pptx, xls, xlsx, cbz, cbr, html, chm, epub, png, jpg, webp, bmp, tiff, mp3, wav, ogg, flac, m4a, mp4, mkv, avi, mov, webm")
+        listed = ", ".join(sorted(ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS))
+        print(f"Supported: {listed}")
         return run_report.write(resolved_report_path)
         
     manifest = ProcessingManifest(dest_dir)
@@ -439,6 +435,16 @@ def build_model_data_products(
     return report
 
 
+def default_finance_source(project_root):
+    """Prefer the external original corpus, else the in-repo finance markdown."""
+    root = Path(project_root)
+    external = root.parent / "DATASETS" / "FINANCE" / "FINANCE_DOCS"
+    local = root / "data" / "datas-finance"
+    if external.is_dir() or not local.is_dir():
+        return str(external)
+    return str(local)
+
+
 if __name__ == "__main__":
     project_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Extract and summarize documents.")
@@ -473,10 +479,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--finance-source",
-        default=str(
-            project_root.parent / "DATASETS" / "FINANCE" / "FINANCE_DOCS"
+        default=default_finance_source(project_root),
+        help=(
+            "Original Finance source directory. Defaults to "
+            "../DATASETS/FINANCE/FINANCE_DOCS when present, otherwise "
+            "data/datas-finance."
         ),
-        help="Original Finance source directory.",
     )
     parser.add_argument(
         "--rag-dir",
@@ -598,8 +606,24 @@ if __name__ == "__main__":
         choices=["auto", "chunks", "summaries"],
         help="Q&A source: prefer chunks automatically (default), require chunks, or use summaries.",
     )
+    parser.add_argument(
+        "--enrich-domain",
+        default="cyber",
+        choices=["cyber", "finance", "generic"],
+        help="Domain prompt for --enrich / --full (default: cyber).",
+    )
     
     args = parser.parse_args()
+    if not 0 <= args.level <= 10:
+        parser.error("--level must be between 0 and 10")
+    if args.threads is not None and args.threads < 1:
+        parser.error("--threads must be at least 1")
+    if args.timeout < 1:
+        parser.error("--timeout must be at least 1")
+    if not 0.0 <= args.enrich_ratio <= 1.0:
+        parser.error("--enrich-ratio must be between 0 and 1")
+    if not 72 <= args.ocr_dpi <= 600:
+        parser.error("--ocr-dpi must be between 72 and 600")
 
     selected_modes = sum(
         bool(mode)
@@ -694,6 +718,7 @@ if __name__ == "__main__":
             enrich=True,
             enrich_ratio=args.enrich_ratio,
             input_format=args.qa_source,
+            enrich_domain=args.enrich_domain,
         )
         print("\n--- Full Pipeline Complete ---")
     elif args.qa:
@@ -715,9 +740,9 @@ if __name__ == "__main__":
             force=args.force,
             enrich_ratio=args.enrich_ratio,
             input_format=args.qa_source,
+            enrich_domain=args.enrich_domain,
         )
     elif args.enrich:
-        import json
         from qa_generator import _enrich_after_dedup
         print("--- Starting Standalone Enrichment ---")
         
@@ -737,10 +762,13 @@ if __name__ == "__main__":
                 ratio=args.enrich_ratio,
                 model_name=args.model,
                 llm_client=llm_client,
-                output_path=enriched_path
+                output_path=enriched_path,
+                domain=args.enrich_domain,
             )
-            with open(enriched_path, 'w', encoding='utf-8') as f:
-                json.dump(enriched, f, ensure_ascii=False, indent=2)
+            atomic_write_text(
+                enriched_path,
+                json.dumps(enriched, ensure_ascii=False, indent=2) + "\n",
+            )
             enriched_count = sum(1 for e in enriched if isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
             print(f"Saved enriched dataset ({enriched_count}/{len(enriched)} entries) to: {enriched_path}")
             from qa_generator import clean_dataset, prepare_hf_dataset

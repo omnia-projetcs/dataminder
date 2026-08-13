@@ -19,6 +19,8 @@ import os
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 
+import threading
+
 from PIL import Image
 from logger import log_error as _shared_log_error
 
@@ -28,8 +30,10 @@ from logger import log_error as _shared_log_error
 _paddleocr_instance = None
 _paddleocr_config = None  # (device, lang) tuple to detect config changes
 _paddleocr_structure_instance = None
+_paddleocr_structure_config = None
 _tesseract_available = None
 _paddleocr_available = None
+_paddleocr_lock = threading.Lock()
 
 
 def _log_error(filepath, error_msg):
@@ -86,18 +90,21 @@ def _get_paddleocr(device="cpu", lang="en"):
     """
     global _paddleocr_instance, _paddleocr_config
     current_config = (device, lang)
-    if _paddleocr_instance is None or _paddleocr_config != current_config:
-        from paddleocr import PaddleOCR
-        _paddleocr_instance = PaddleOCR(
-            lang=lang,
-            use_doc_orientation_classify=True,  # Auto-correct orientation
-            use_doc_unwarping=True,             # Auto-correct distortion/warping
-            use_textline_orientation=True,       # Correct text line direction
-            device=device,
-            enable_mkldnn=False,
-        )
-        _paddleocr_config = current_config
-        print(f"[PaddleOCR] Initialized PP-OCRv5 engine (device={device}, lang={lang})")
+    if _paddleocr_instance is not None and _paddleocr_config == current_config:
+        return _paddleocr_instance
+    with _paddleocr_lock:
+        if _paddleocr_instance is None or _paddleocr_config != current_config:
+            from paddleocr import PaddleOCR
+            _paddleocr_instance = PaddleOCR(
+                lang=lang,
+                use_doc_orientation_classify=True,  # Auto-correct orientation
+                use_doc_unwarping=True,             # Auto-correct distortion/warping
+                use_textline_orientation=True,       # Correct text line direction
+                device=device,
+                enable_mkldnn=False,
+            )
+            _paddleocr_config = current_config
+            print(f"[PaddleOCR] Initialized PP-OCRv5 engine (device={device}, lang={lang})")
     return _paddleocr_instance
 
 
@@ -175,40 +182,38 @@ def paddleocr_pdf_to_string(pdf_path, device="cpu", lang="en", dpi=200, max_page
     all_text = []
 
     try:
-        doc = fitz.open(pdf_path)
-        total_pages = len(doc)
-        pages_to_process = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+        with fitz.open(pdf_path) as doc:
+            total_pages = len(doc)
+            pages_to_process = total_pages if max_pages <= 0 else min(total_pages, max_pages)
 
-        if max_pages > 0 and total_pages > max_pages:
-            print(f"[PaddleOCR] PDF has {total_pages} pages, limiting to {max_pages} (use --ocr-max-pages to change)")
+            if max_pages > 0 and total_pages > max_pages:
+                print(f"[PaddleOCR] PDF has {total_pages} pages, limiting to {max_pages} (use --ocr-max-pages to change)")
 
-        zoom = dpi / 72.0
-        mat = fitz.Matrix(zoom, zoom)
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
 
-        for page_num in range(pages_to_process):
-            try:
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=mat)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                img_np = np.array(img)
-                # Release pixmap memory immediately
-                del pix
+            for page_num in range(pages_to_process):
+                try:
+                    page = doc[page_num]
+                    pix = page.get_pixmap(matrix=mat)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    img_np = np.array(img)
+                    # Release pixmap memory immediately
+                    del pix
 
-                results = ocr.predict(img_np)
-                del img_np, img
+                    results = ocr.predict(img_np)
+                    del img_np, img
 
-                for res in results:
-                    if hasattr(res, 'rec_texts') and res.rec_texts:
-                        for text in res.rec_texts:
-                            if text and text.strip():
-                                all_text.append(text.strip())
-                    elif hasattr(res, 'text') and res.text:
-                        all_text.append(res.text.strip())
-            except Exception as e:
-                print(f"[PaddleOCR] Failed on page {page_num + 1}/{pages_to_process}: {e}")
-                continue
-
-        doc.close()
+                    for res in results:
+                        if hasattr(res, 'rec_texts') and res.rec_texts:
+                            for text in res.rec_texts:
+                                if text and text.strip():
+                                    all_text.append(text.strip())
+                        elif hasattr(res, 'text') and res.text:
+                            all_text.append(res.text.strip())
+                except Exception as e:
+                    print(f"[PaddleOCR] Failed on page {page_num + 1}/{pages_to_process}: {e}")
+                    continue
     except Exception as e:
         _log_error(pdf_path, f"PaddleOCR PDF processing failed: {e}")
 
@@ -229,16 +234,28 @@ def _get_paddleocr_structure(device="cpu"):
       - Formulas → LaTeX
       - Full document → structured Markdown
     """
-    global _paddleocr_structure_instance
-    if _paddleocr_structure_instance is None:
-        try:
-            from paddleocr import PPStructureV3
-            _paddleocr_structure_instance = PPStructureV3(device=device)
-            print(f"[PaddleOCR] Initialized PP-StructureV3 engine (device={device})")
-        except ImportError:
-            # PP-StructureV3 may require additional dependencies
-            print("[PaddleOCR] PP-StructureV3 not available. Install with: pip install 'paddleocr[structure]'")
-            return None
+    global _paddleocr_structure_instance, _paddleocr_structure_config
+    if (
+        _paddleocr_structure_instance is not None
+        and _paddleocr_structure_config == device
+    ):
+        return _paddleocr_structure_instance
+    with _paddleocr_lock:
+        if (
+            _paddleocr_structure_instance is None
+            or _paddleocr_structure_config != device
+        ):
+            try:
+                from paddleocr import PPStructureV3
+                _paddleocr_structure_instance = PPStructureV3(device=device)
+                _paddleocr_structure_config = device
+                print(f"[PaddleOCR] Initialized PP-StructureV3 engine (device={device})")
+            except ImportError:
+                # PP-StructureV3 may require additional dependencies
+                print("[PaddleOCR] PP-StructureV3 not available. Install with: pip install 'paddleocr[structure]'")
+                _paddleocr_structure_instance = None
+                _paddleocr_structure_config = None
+                return None
     return _paddleocr_structure_instance
 
 
@@ -438,35 +455,34 @@ def _tesseract_pdf_fallback(pdf_path, lang, dpi=200, max_pages=0):
         return ""
     try:
         import fitz
-        doc = fitz.open(pdf_path)
-        total_pages = len(doc)
-        pages_to_process = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+        with fitz.open(pdf_path) as doc:
+            total_pages = len(doc)
+            pages_to_process = total_pages if max_pages <= 0 else min(total_pages, max_pages)
 
-        if max_pages > 0 and total_pages > max_pages:
-            print(f"[Tesseract] PDF has {total_pages} pages, limiting to {max_pages} (use --ocr-max-pages to change)")
+            if max_pages > 0 and total_pages > max_pages:
+                print(f"[Tesseract] PDF has {total_pages} pages, limiting to {max_pages} (use --ocr-max-pages to change)")
 
-        zoom = dpi / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        tess_lang = _lang_to_tesseract(lang)
-        text_parts = []
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            tess_lang = _lang_to_tesseract(lang)
+            text_parts = []
 
-        for page_num in range(pages_to_process):
-            try:
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=mat)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                del pix  # Release pixmap memory immediately
+            for page_num in range(pages_to_process):
+                try:
+                    page = doc[page_num]
+                    pix = page.get_pixmap(matrix=mat)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    del pix  # Release pixmap memory immediately
 
-                page_text = tesseract_image_to_string(img, lang=tess_lang)
-                del img  # Release image memory immediately
+                    page_text = tesseract_image_to_string(img, lang=tess_lang)
+                    del img  # Release image memory immediately
 
-                if page_text:
-                    text_parts.append(page_text)
-            except Exception as e:
-                print(f"[Tesseract] Failed on page {page_num + 1}/{pages_to_process}: {e}")
-                continue
+                    if page_text:
+                        text_parts.append(page_text)
+                except Exception as e:
+                    print(f"[Tesseract] Failed on page {page_num + 1}/{pages_to_process}: {e}")
+                    continue
 
-        doc.close()
         return "\n".join(text_parts)
     except Exception as e:
         _log_error(pdf_path, f"Tesseract PDF fallback failed: {e}")

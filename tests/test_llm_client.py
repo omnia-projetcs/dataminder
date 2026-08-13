@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+import requests
+
 from llm_client import LLMClient
 
 
@@ -74,6 +76,44 @@ class LLMClientGenerationTests(unittest.TestCase):
     def test_temperature_must_be_in_supported_range(self):
         with self.assertRaises(ValueError):
             LLMClient(temperature=2.1)
+
+    def test_client_http_errors_are_not_retried(self):
+        client = LLMClient(provider="ollama")
+        response = requests.Response()
+        response.status_code = 400
+        error = requests.HTTPError("bad request")
+        error.response = response
+        with patch.object(client, "_chat_ollama", side_effect=error) as chat_mock:
+            with patch("llm_client.time.sleep") as sleep_mock:
+                with self.assertRaises(requests.HTTPError):
+                    client.chat("model", [{"role": "user", "content": "question"}])
+        self.assertEqual(chat_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_vllm_uses_requested_model_not_autodetected(self):
+        client = LLMClient(provider="vllm")
+        client._vllm_endpoint = "chat"
+        client._vllm_model = "server-default"
+        session = _Session(
+            _Response({"choices": [{"message": {"content": "ok"}}]})
+        )
+        with patch.object(client, "_session", return_value=session):
+            result = client._chat_vllm(
+                "user-model",
+                [{"role": "user", "content": "question"}],
+            )
+        self.assertEqual(result, "ok")
+        self.assertEqual(session.calls[0][1]["json"]["model"], "user-model")
+
+    def test_close_invalidates_pooled_sessions(self):
+        client = LLMClient(provider="ollama")
+        first = client._session()
+        second = client._session()
+        self.assertIs(first, second)
+        client.close()
+        third = client._session()
+        self.assertIsNot(first, third)
+        self.assertEqual(len(client._sessions), 1)
 
 
 if __name__ == "__main__":

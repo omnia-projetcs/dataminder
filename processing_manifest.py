@@ -90,7 +90,12 @@ class ProcessingManifest:
             return False
         if entry.get("pipeline_fingerprint") != pipeline_fingerprint:
             return False
-        return all(os.path.exists(path) for path in outputs.values())
+        # Existence alone is not enough: a crash or empty write must not
+        # count as a successful, resumable output.
+        return all(
+            os.path.exists(path) and os.path.getsize(path) > 0
+            for path in outputs.values()
+        )
 
     def mark_success(
         self,

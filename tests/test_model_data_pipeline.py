@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import build_model_data_products
+from main import build_model_data_products, default_finance_source
 
 
 class ModelDataPipelineTests(unittest.TestCase):
@@ -75,7 +75,8 @@ class ModelDataPipelineTests(unittest.TestCase):
                 self.assertTrue(training.is_file())
                 self.assertTrue(colab.is_file())
 
-                with sqlite3.connect(database) as connection:
+                connection = sqlite3.connect(database)
+                try:
                     self.assertEqual(
                         connection.execute(
                             "PRAGMA integrity_check"
@@ -100,6 +101,8 @@ class ModelDataPipelineTests(unittest.TestCase):
                         ).fetchone()[0],
                         domain,
                     )
+                finally:
+                    connection.close()
 
                 training_rows = [
                     json.loads(line)
@@ -127,6 +130,14 @@ class ModelDataPipelineTests(unittest.TestCase):
                         for row in colab_rows
                     )
                 )
+
+
+    def test_finance_source_falls_back_to_local_corpus(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "data" / "datas-finance"
+            local.mkdir(parents=True)
+            self.assertEqual(default_finance_source(root), str(local))
 
 
 if __name__ == "__main__":

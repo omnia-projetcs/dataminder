@@ -24,6 +24,18 @@ from bs4 import BeautifulSoup
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_finance_source(project_root: Path | None = None) -> Path:
+    """Prefer the external original corpus, else the in-repo finance markdown."""
+    root = project_root or ROOT
+    external = root.parent / "DATASETS" / "FINANCE" / "FINANCE_DOCS"
+    local = root / "data" / "datas-finance"
+    if external.is_dir() or not local.is_dir():
+        return external
+    return local
+
+
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".epub", ".md", ".rst", ".txt", ".doc", ".pptx",
 }
@@ -470,8 +482,6 @@ def build_database(
     os.close(descriptor)
     temporary_path = Path(temporary_name)
     connection = sqlite3.connect(temporary_path)
-    create_schema(connection)
-
     stats: collections.Counter[str] = collections.Counter()
     category_counts: collections.Counter[str] = collections.Counter()
     seen_documents: dict[str, int] = {}
@@ -479,6 +489,7 @@ def build_database(
     start_time = time.time()
 
     try:
+        create_schema(connection)
         for position, path in enumerate(files, 1):
             relative = path.relative_to(source_root)
             category = (
@@ -671,7 +682,7 @@ def main() -> int:
     parser.add_argument(
         "--finance-source",
         type=Path,
-        default=ROOT.parent / "DATASETS" / "FINANCE" / "FINANCE_DOCS",
+        default=default_finance_source(),
     )
     parser.add_argument(
         "--output-dir",

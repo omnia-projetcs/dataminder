@@ -9,6 +9,7 @@ Video files have their audio track extracted via ffmpeg before transcription.
 import os
 import subprocess
 import tempfile
+import threading
 from logger import log_error as _shared_log_error
 
 # Lazy-loaded faster-whisper model (singleton to avoid reloading)
@@ -16,6 +17,7 @@ _whisper_model_instance = None
 _whisper_model_size = None
 _whisper_device = None
 _whisper_compute_type = None
+_whisper_lock = threading.Lock()
 
 # Supported extensions
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.ogg', '.flac', '.m4a', '.wma', '.aac'}
@@ -50,19 +52,26 @@ def _get_model(model_size="base", device="cpu"):
             and _whisper_compute_type == compute_type):
         return _whisper_model_instance
 
-    from faster_whisper import WhisperModel
+    with _whisper_lock:
+        if (_whisper_model_instance is not None
+                and _whisper_model_size == model_size
+                and _whisper_device == device
+                and _whisper_compute_type == compute_type):
+            return _whisper_model_instance
 
-    print(f"[Whisper] Loading model '{model_size}' on {device} ({compute_type})...")
-    _whisper_model_instance = WhisperModel(
-        model_size,
-        device=device,
-        compute_type=compute_type
-    )
-    _whisper_model_size = model_size
-    _whisper_device = device
-    _whisper_compute_type = compute_type
-    print(f"[Whisper] Model '{model_size}' ready.")
-    return _whisper_model_instance
+        from faster_whisper import WhisperModel
+
+        print(f"[Whisper] Loading model '{model_size}' on {device} ({compute_type})...")
+        _whisper_model_instance = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type
+        )
+        _whisper_model_size = model_size
+        _whisper_device = device
+        _whisper_compute_type = compute_type
+        print(f"[Whisper] Model '{model_size}' ready.")
+        return _whisper_model_instance
 
 
 def _check_ffmpeg():
@@ -70,10 +79,10 @@ def _check_ffmpeg():
     try:
         subprocess.run(
             ["ffmpeg", "-version"],
-            capture_output=True, check=True
+            capture_output=True, check=True, timeout=10,
         )
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
 
 
@@ -101,12 +110,15 @@ def _extract_audio_from_video(video_path, output_path):
                 "-y",                   # Overwrite output
                 output_path
             ],
-            capture_output=True, check=True
+            capture_output=True, check=True, timeout=300,
         )
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
         _log_error(video_path, f"ffmpeg audio extraction failed: {stderr[:500]}")
+        return False
+    except subprocess.TimeoutExpired:
+        _log_error(video_path, "ffmpeg audio extraction timed out after 300s")
         return False
 
 

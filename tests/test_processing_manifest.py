@@ -84,6 +84,39 @@ class ProcessingManifestTests(unittest.TestCase):
                 )
             )
 
+    def test_manifest_rejects_empty_output_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dest_dir = os.path.join(temp_dir, "export")
+            os.makedirs(dest_dir)
+            outputs = {
+                "markdown": os.path.join(dest_dir, "doc.md"),
+                "chunks": os.path.join(dest_dir, "doc.chunks.jsonl"),
+                "document": os.path.join(dest_dir, "doc.document.json"),
+            }
+            for path in outputs.values():
+                atomic_write_text(path, "ok")
+            empty_path = outputs["markdown"]
+            with open(empty_path, "w", encoding="utf-8"):
+                pass
+
+            manifest = ProcessingManifest(dest_dir)
+            fingerprint = stable_fingerprint({"model": "local"})
+            manifest.mark_success(
+                "doc.txt",
+                source_sha256="abc",
+                pipeline_fingerprint=fingerprint,
+                outputs=outputs,
+                document_id="sha256:abc",
+            )
+            self.assertFalse(
+                manifest.is_current(
+                    "doc.txt",
+                    source_sha256="abc",
+                    pipeline_fingerprint=fingerprint,
+                    outputs=outputs,
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

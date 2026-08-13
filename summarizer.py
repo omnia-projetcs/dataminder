@@ -46,7 +46,7 @@ def _clean_output(text):
 
 def summarize_text(text, model_name="gemma3:4b-it-q4_K_M", level=7, llm_client=None):
     if not text or not text.strip():
-        return "No text provided for summarization."
+        raise SummarizationError("No text provided for summarization.")
 
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
@@ -116,7 +116,12 @@ Document:
             ],
             keep_alive=-1
         )
-        return _clean_output(content)
+        cleaned = _clean_output(content)
+        if not cleaned:
+            raise SummarizationError(
+                f"Model '{model_name}' returned an empty summary via {llm_client}"
+            )
+        return cleaned
     except Exception as e:
         raise SummarizationError(
             f"Could not summarize with model '{model_name}' via {llm_client}: {e}"

@@ -1,6 +1,7 @@
 import os
 import fitz  # PyMuPDF
 import zipfile
+from dataclasses import asdict, dataclass
 from PIL import Image
 import subprocess
 import tempfile
@@ -13,17 +14,33 @@ from transcriber import (
     AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 )
 
-# Module-level OCR configuration (set by main.py based on CLI args)
-_ocr_engine = "tesseract"
-_ocr_device = "cpu"
-_ocr_lang = "en"
-_ocr_dpi = 200
-_ocr_max_pages = 0
+DOCUMENT_EXTENSIONS = {
+    ".txt", ".md", ".rst", ".docx", ".pdf", ".cbz", ".cbr",
+    ".doc", ".pptx", ".xls", ".xlsx", ".html", ".htm", ".chm",
+    ".epub", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif",
+}
+SUPPORTED_EXTENSIONS = DOCUMENT_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+_HTML_NOISE_TAGS = ("script", "style", "noscript", "template")
 
-# Module-level Whisper configuration (set by main.py based on CLI args)
-_whisper_model = "base"
-_whisper_device = "cpu"
-_whisper_lang = None
+
+@dataclass
+class ExtractionSettings:
+    """Active OCR and transcription settings for the native extractor."""
+
+    ocr_engine: str = "tesseract"
+    ocr_device: str = "cpu"
+    ocr_lang: str = "en"
+    ocr_dpi: int = 200
+    ocr_max_pages: int = 0
+    whisper_model: str = "base"
+    whisper_device: str = "cpu"
+    whisper_lang: str | None = None
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+_settings = ExtractionSettings()
 
 
 def configure_ocr(engine="tesseract", device="cpu", lang="en", dpi=200, max_pages=0):
@@ -38,19 +55,18 @@ def configure_ocr(engine="tesseract", device="cpu", lang="en", dpi=200, max_page
              Lower values use less RAM. Range: 72-600.
         max_pages: Maximum pages to OCR per PDF (0 = unlimited).
     """
-    global _ocr_engine, _ocr_device, _ocr_lang, _ocr_dpi, _ocr_max_pages
-    _ocr_engine = engine
-    _ocr_device = device
-    _ocr_lang = lang
-    _ocr_dpi = max(72, min(600, dpi))
-    _ocr_max_pages = max(0, max_pages)
+    _settings.ocr_engine = engine
+    _settings.ocr_device = device
+    _settings.ocr_lang = lang
+    _settings.ocr_dpi = max(72, min(600, dpi))
+    _settings.ocr_max_pages = max(0, max_pages)
 
     engine_name = "PaddleOCR PP-OCRv5" if engine == "paddleocr" else "Tesseract"
     extras = []
     if dpi != 200:
-        extras.append(f"dpi={_ocr_dpi}")
+        extras.append(f"dpi={_settings.ocr_dpi}")
     if max_pages > 0:
-        extras.append(f"max_pages={_ocr_max_pages}")
+        extras.append(f"max_pages={_settings.ocr_max_pages}")
     extra_str = f", {', '.join(extras)}" if extras else ""
     print(f"[OCR] Configured: engine={engine_name}, device={device}, lang={lang}{extra_str}")
 
@@ -64,38 +80,51 @@ def configure_whisper(model="base", device="cpu", lang=None):
         device: "cpu" or "cuda".
         lang: Language code (e.g., "en", "fr"). None for auto-detection.
     """
-    global _whisper_model, _whisper_device, _whisper_lang
-    _whisper_model = model
-    _whisper_device = device
-    _whisper_lang = lang
+    _settings.whisper_model = model
+    _settings.whisper_device = device
+    _settings.whisper_lang = lang
     lang_display = lang if lang else "auto-detect"
     print(f"[Whisper] Configured: model={model}, device={device}, lang={lang_display}")
 
 
 def extraction_config():
     """Return the active extraction configuration for cache invalidation."""
-    return {
-        "ocr_engine": _ocr_engine,
-        "ocr_device": _ocr_device,
-        "ocr_lang": _ocr_lang,
-        "ocr_dpi": _ocr_dpi,
-        "ocr_max_pages": _ocr_max_pages,
-        "whisper_model": _whisper_model,
-        "whisper_device": _whisper_device,
-        "whisper_lang": _whisper_lang,
-    }
+    return _settings.as_dict()
 
 def log_error(filepath, error_msg):
     _log_error(filepath, error_msg, category="EXTRACTION")
 
+def _read_text_file(path):
+    """Read a text file with encoding fallbacks common in mixed corpora."""
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
 def extract_text_from_txt(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        return f.read()
+    return _read_text_file(path)
 
 def extract_text_from_docx(path):
     from docx import Document
     doc = Document(path)
-    return "\n".join([para.text for para in doc.paragraphs])
+    parts = [para.text for para in doc.paragraphs if para.text and para.text.strip()]
+    for table in doc.tables:
+        try:
+            rows = []
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    rows.append(" | ".join(cells))
+            if rows:
+                parts.append("\n".join(rows))
+        except Exception as e:
+            log_error(path, f"Could not extract a DOCX table: {e}")
+    return "\n\n".join(parts)
 
 def extract_text_from_pdf(path, structured=False):
     """
@@ -112,7 +141,7 @@ def extract_text_from_pdf(path, structured=False):
     """
     # Structured mode: use PP-StructureV3 if available
     if structured:
-        result = structured_parse(path, device=_ocr_device)
+        result = structured_parse(path, device=_settings.ocr_device)
         if result:
             return result
         print(f"[{path}] PP-StructureV3 unavailable or failed. Falling back to standard extraction.")
@@ -120,14 +149,14 @@ def extract_text_from_pdf(path, structured=False):
     text = ""
     # Try normal PDF extraction first
     try:
-        doc = fitz.open(path)
-        for page in doc:
-            text += page.get_text()
-        
-        # If the extracted text is very short compared to the number of pages, it's likely a scanned PDF
-        if len(text.strip()) < 50 * len(doc):
-            print(f"[{path}] PDF appears to be scanned or contains little text. Switching to OCR...")
-            text = extract_text_from_pdf_ocr(path)
+        with fitz.open(path) as doc:
+            for page in doc:
+                text += page.get_text()
+
+            # If the extracted text is very short compared to the number of pages, it's likely a scanned PDF
+            if len(text.strip()) < 50 * len(doc):
+                print(f"[{path}] PDF appears to be scanned or contains little text. Switching to OCR...")
+                text = extract_text_from_pdf_ocr(path)
     except Exception as e:
         print(f"[{path}] Error reading PDF directly: {e}. Trying OCR...")
         text = extract_text_from_pdf_ocr(path)
@@ -149,9 +178,9 @@ def extract_text_from_pdf_ocr(path):
       - Traditional LSTM-based OCR
     """
     try:
-        return ocr_pdf(path, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang, dpi=_ocr_dpi, max_pages=_ocr_max_pages)
+        return ocr_pdf(path, engine=_settings.ocr_engine, device=_settings.ocr_device, lang=_settings.ocr_lang, dpi=_settings.ocr_dpi, max_pages=_settings.ocr_max_pages)
     except Exception as e:
-        log_error(path, f"Failed to extract text via OCR ({_ocr_engine}). Error: {e}")
+        log_error(path, f"Failed to extract text via OCR ({_settings.ocr_engine}). Error: {e}")
         return ""
 
 def extract_text_from_cbz_cbr(path):
@@ -170,8 +199,8 @@ def extract_text_from_cbz_cbr(path):
                 image_files.sort()
                 for img_name in image_files:
                     with archive.open(img_name) as file:
-                        img = Image.open(file)
-                        text += ocr_image(img, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang) + "\n"
+                        with Image.open(file) as img:
+                            text += ocr_image(img.copy(), engine=_settings.ocr_engine, device=_settings.ocr_device, lang=_settings.ocr_lang) + "\n"
         elif ext == '.cbr':
             import rarfile
             with rarfile.RarFile(path, 'r') as archive:
@@ -179,8 +208,8 @@ def extract_text_from_cbz_cbr(path):
                 image_files.sort()
                 for img_name in image_files:
                     with archive.open(img_name) as file:
-                        img = Image.open(file)
-                        text += ocr_image(img, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang) + "\n"
+                        with Image.open(file) as img:
+                            text += ocr_image(img.copy(), engine=_settings.ocr_engine, device=_settings.ocr_device, lang=_settings.ocr_lang) + "\n"
         return text
     except Exception as e:
         log_error(path, f"Error reading archive (CBZ/CBR): {e}. Make sure 'unrar' is installed.")
@@ -193,8 +222,17 @@ def extract_text_from_pptx(path):
         text = ""
         for slide in prs.slides:
             for shape in slide.shapes:
-                if hasattr(shape, "text"):
+                if getattr(shape, "has_text_frame", False):
+                    text += shape.text_frame.text + "\n"
+                elif hasattr(shape, "text"):
                     text += shape.text + "\n"
+            try:
+                if slide.has_notes_slide:
+                    notes = slide.notes_slide.notes_text_frame
+                    if notes and notes.text.strip():
+                        text += notes.text + "\n"
+            except Exception:
+                pass
         return text
     except Exception as e:
         log_error(path, f"Error reading PPTX: {e}")
@@ -203,7 +241,13 @@ def extract_text_from_pptx(path):
 def extract_text_from_doc(path):
     try:
         # Requires antiword installed on the system
-        result = subprocess.run(['antiword', path], capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            ['antiword', path],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        )
         return result.stdout
     except Exception as e:
         log_error(path, f"Error reading DOC: {e}. Make sure 'antiword' is installed.")
@@ -217,42 +261,51 @@ def extract_text_from_excel(path):
         dfs = pd.read_excel(path, sheet_name=None)
         for sheet_name, df in dfs.items():
             text += f"--- Sheet: {sheet_name} ---\n"
-            # to_string will convert the dataframe to a readable text table
-            text += df.to_string(index=False) + "\n\n"
+            text += df.fillna("").to_string(index=False) + "\n\n"
         return text
     except Exception as e:
         log_error(path, f"Error reading Excel file: {e}")
         return ""
 
+def _html_visible_text(html):
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(_HTML_NOISE_TAGS):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
+
+
 def extract_text_from_html(path):
     try:
-        from bs4 import BeautifulSoup
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            soup = BeautifulSoup(f, 'html.parser')
-            return soup.get_text(separator='\n', strip=True)
+        return _html_visible_text(_read_text_file(path))
     except Exception as e:
         log_error(path, f"Error reading HTML: {e}")
         return ""
 
 def extract_text_from_chm(path):
     try:
-        from bs4 import BeautifulSoup
         text = ""
         # Create a temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
             # Requires libchm-bin installed on the system
-            subprocess.run(['extract_chmLib', path, temp_dir], capture_output=True, check=True)
+            subprocess.run(
+                ['extract_chmLib', path, temp_dir],
+                capture_output=True,
+                check=True,
+                timeout=180,
+            )
             
-            # Find all HTML files in the extracted directory
-            for root, _, files in os.walk(temp_dir):
-                for file in files:
+            html_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                dirs.sort()
+                for file in sorted(files):
                     if file.lower().endswith(('.html', '.htm')):
-                        file_path = os.path.join(root, file)
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            soup = BeautifulSoup(f, 'html.parser')
-                            extracted = soup.get_text(separator='\n', strip=True)
-                            if extracted:
-                                text += f"--- Section: {file} ---\n" + extracted + "\n\n"
+                        html_files.append(os.path.join(root, file))
+            for file_path in html_files:
+                extracted = _html_visible_text(_read_text_file(file_path))
+                if extracted:
+                    text += f"--- Section: {os.path.basename(file_path)} ---\n" + extracted + "\n\n"
         return text
     except Exception as e:
         log_error(path, f"Error reading CHM: {e}. Make sure 'libchm-bin' is installed.")
@@ -261,13 +314,11 @@ def extract_text_from_chm(path):
 def extract_text_from_epub(path):
     try:
         import ebooklib
-        from bs4 import BeautifulSoup
         from ebooklib import epub
         book = epub.read_epub(path, options={'ignore_ncx': True})
         text = ""
         for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-            soup = BeautifulSoup(item.get_content(), 'html.parser')
-            extracted = soup.get_text(separator='\n', strip=True)
+            extracted = _html_visible_text(item.get_content())
             if extracted:
                 text += extracted + "\n\n"
         return text
@@ -282,8 +333,9 @@ def extract_text_from_image(path):
     Supports: PNG, JPG, JPEG, WEBP, BMP, TIFF.
     """
     try:
-        img = Image.open(path)
-        return ocr_image(img, engine=_ocr_engine, device=_ocr_device, lang=_ocr_lang)
+        with Image.open(path) as img:
+            loaded = img.copy()
+        return ocr_image(loaded, engine=_settings.ocr_engine, device=_settings.ocr_device, lang=_settings.ocr_lang)
     except Exception as e:
         log_error(path, f"Error reading image for OCR: {e}")
         return ""
@@ -297,9 +349,9 @@ def extract_text_from_audio(path):
     try:
         return transcribe_audio(
             path,
-            model_size=_whisper_model,
-            device=_whisper_device,
-            language=_whisper_lang
+            model_size=_settings.whisper_model,
+            device=_settings.whisper_device,
+            language=_settings.whisper_lang
         )
     except Exception as e:
         log_error(path, f"Error transcribing audio: {e}")
@@ -315,9 +367,9 @@ def extract_text_from_video(path):
     try:
         return transcribe_video(
             path,
-            model_size=_whisper_model,
-            device=_whisper_device,
-            language=_whisper_lang
+            model_size=_settings.whisper_model,
+            device=_settings.whisper_device,
+            language=_settings.whisper_lang
         )
     except Exception as e:
         log_error(path, f"Error transcribing video: {e}")
@@ -374,7 +426,7 @@ def _pdf_document(path, source_sha256, structured=False):
     document = create_document(path, source_sha256=source_sha256)
 
     if structured:
-        structured_text = structured_parse(path, device=_ocr_device)
+        structured_text = structured_parse(path, device=_settings.ocr_device)
         if structured_text:
             document.blocks = blocks_from_text(
                 structured_text,
@@ -404,29 +456,28 @@ def _pdf_document(path, source_sha256, structured=False):
                 page_text = native_text
                 method = "pymupdf"
                 sparse = len(native_text.strip()) < 50
-                within_ocr_limit = _ocr_max_pages == 0 or ocr_pages < _ocr_max_pages
+                within_ocr_limit = _settings.ocr_max_pages == 0 or ocr_pages < _settings.ocr_max_pages
 
                 if sparse and within_ocr_limit:
                     try:
-                        zoom = _ocr_dpi / 72.0
+                        zoom = _settings.ocr_dpi / 72.0
                         pixmap = page.get_pixmap(
                             matrix=fitz.Matrix(zoom, zoom), alpha=False
                         )
-                        image = Image.frombytes(
-                            "RGB",
-                            (pixmap.width, pixmap.height),
-                            pixmap.samples,
-                        )
+                        size = (pixmap.width, pixmap.height)
+                        samples = bytes(pixmap.samples)
+                        del pixmap
+                        image = Image.frombytes("RGB", size, samples)
                         ocr_text = ocr_image(
                             image,
-                            engine=_ocr_engine,
-                            device=_ocr_device,
-                            lang=_ocr_lang,
+                            engine=_settings.ocr_engine,
+                            device=_settings.ocr_device,
+                            lang=_settings.ocr_lang,
                         )
                         ocr_pages += 1
                         if ocr_text and ocr_text.strip():
                             page_text = ocr_text
-                            method = f"{_ocr_engine}-ocr"
+                            method = f"{_settings.ocr_engine}-ocr"
                         elif not native_text.strip():
                             document.diagnostics.append(
                                 {
@@ -470,10 +521,10 @@ def _pdf_document(path, source_sha256, structured=False):
         document.blocks = blocks_from_text(
             fallback_text,
             document.id,
-            extraction_method=f"{_ocr_engine}-ocr",
+            extraction_method=f"{_settings.ocr_engine}-ocr",
         )
         if fallback_text.strip():
-            methods.add(f"{_ocr_engine}-ocr")
+            methods.add(f"{_settings.ocr_engine}-ocr")
 
     document.metadata.update(
         {
@@ -511,7 +562,7 @@ def extract_document(path, structured=False, source_sha256=None) -> DocumentIR:
     if ext in AUDIO_EXTENSIONS or ext in VIDEO_EXTENSIONS:
         method = "faster-whisper"
     elif ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".cbz", ".cbr"}:
-        method = f"{_ocr_engine}-ocr"
+        method = f"{_settings.ocr_engine}-ocr"
     else:
         method = method_by_extension.get(ext, "unknown")
 
