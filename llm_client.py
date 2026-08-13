@@ -209,7 +209,10 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data.get("message", {}).get("content", "")
+        return self._require_text(
+            data.get("message", {}).get("content", ""),
+            "Ollama",
+        )
 
     def _chat_vllm(self, model, messages):
         headers = {"Content-Type": "application/json"}
@@ -294,7 +297,7 @@ class LLMClient:
         resp = self._session().post(url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        return self._require_text(self._choice_field(data, "message", "content"), "vLLM chat")
 
     def _call_completions(self, model, messages, headers):
         """Call the /v1/completions endpoint, formatting chat messages into a single prompt."""
@@ -311,7 +314,24 @@ class LLMClient:
         resp = self._session().post(url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["text"]
+        return self._require_text(self._choice_field(data, None, "text"), "vLLM completions")
+
+    @staticmethod
+    def _choice_field(data, message_key, field):
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            raise RuntimeError("LLM returned no choices")
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        if message_key:
+            first = first.get(message_key) or {}
+        return first.get(field, "")
+
+    @staticmethod
+    def _require_text(content, source):
+        text = content if isinstance(content, str) else ""
+        if not text.strip():
+            raise RuntimeError(f"{source} returned an empty response")
+        return text
 
     @staticmethod
     def _messages_to_prompt(messages):

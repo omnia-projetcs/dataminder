@@ -155,6 +155,8 @@ def export_database(
     min_words: int,
     max_chunks_per_document: int,
 ) -> dict:
+    if not database.is_file():
+        raise FileNotFoundError(f"RAG database not found: {database}")
     connection = sqlite3.connect(f"file:{database.resolve()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     domain = database_domain(connection)

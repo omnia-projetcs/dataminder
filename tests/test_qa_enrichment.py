@@ -3,12 +3,8 @@ import os
 import tempfile
 import unittest
 
-from qa_generator import (
-    _enrich_after_dedup,
-    _extract_balanced_json_array,
-    _try_parse_json,
-    clean_dataset,
-)
+from json_repair import _extract_balanced_json_array, _try_parse_json
+from qa_generator import _enrich_after_dedup, clean_dataset
 
 
 class _EnrichingLLM:

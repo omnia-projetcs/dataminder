@@ -56,6 +56,45 @@ class DatasetExportTests(unittest.TestCase):
             "### Instruction:\nQ\n\n### Response:\nA",
         )
 
+    def test_iter_alpaca_records_skips_utf8_bom(self):
+        from dataset_export import iter_alpaca_records
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "bom.json")
+            payload = [
+                {
+                    "instruction": "What is TLS?",
+                    "input": "",
+                    "output": "Transport Layer Security.",
+                }
+            ]
+            with open(path, "w", encoding="utf-8-sig") as output:
+                json.dump(payload, output)
+            rows = list(iter_alpaca_records(path))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["instruction"], "What is TLS?")
+
+    def test_clean_dataset_accepts_jsonl_input(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "pairs.jsonl")
+            with open(source, "w", encoding="utf-8") as output:
+                output.write(
+                    json.dumps(
+                        {
+                            "instruction": "What is TLS?",
+                            "input": "",
+                            "output": "Transport Layer Security.",
+                        }
+                    )
+                    + "\n"
+                )
+                output.write(json.dumps({"instruction": "", "output": "drop"}) + "\n")
+            cleaned = clean_dataset(source)
+            with open(cleaned, encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["instruction"], "What is TLS?")
+
 
 class ExtractionSettingsTests(unittest.TestCase):
     def tearDown(self):

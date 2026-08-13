@@ -2,8 +2,9 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from main import process_documents
+from main import process_documents, resolve_full_qa_dest, resolve_qa_io_paths
 
 
 class _NoopLLM:
@@ -78,6 +79,65 @@ class PipelineIntegrationTests(unittest.TestCase):
             with open(report_path, "r", encoding="utf-8") as source:
                 stored_report = json.load(source)
             self.assertEqual(stored_report["summary"], second_report["summary"])
+
+    def test_empty_summary_is_not_cached_as_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = os.path.join(temp_dir, "source")
+            dest_dir = os.path.join(temp_dir, "export")
+            os.makedirs(source_dir)
+            source = os.path.join(source_dir, "note.txt")
+            with open(source, "w", encoding="utf-8") as output:
+                output.write("Useful technical content about TLS 1.3.")
+
+            with patch("main.summarize_text", return_value=""):
+                report = process_documents(
+                    source_dir,
+                    dest_dir,
+                    model_name="unused",
+                    level=3,
+                    llm_client=_NoopLLM(),
+                )
+
+            self.assertEqual(report["summary"]["failed"], 1)
+            self.assertEqual(report["summary"]["success"], 0)
+            self.assertFalse(
+                os.path.exists(os.path.join(dest_dir, "note.txt.md"))
+            )
+
+    def test_missing_source_does_not_create_the_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = os.path.join(temp_dir, "missing-source")
+            dest_dir = os.path.join(temp_dir, "export")
+            report = process_documents(
+                source_dir,
+                dest_dir,
+                model_name="unused",
+                level=0,
+                llm_client=_NoopLLM(),
+            )
+            self.assertFalse(os.path.isdir(source_dir))
+            self.assertEqual(report["summary"]["document_count"], 0)
+
+    def test_qa_path_aliases_ignore_relative_spelling(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "data", "source")
+            export = os.path.join(root, "data", "export")
+            os.makedirs(source)
+            qa_source, qa_dest = resolve_qa_io_paths(
+                os.path.join(root, "data", "source") + os.sep,
+                os.path.join(root, "data", "export"),
+                project_root=root,
+            )
+            self.assertEqual(os.path.realpath(qa_source), os.path.realpath(export))
+            self.assertEqual(
+                os.path.realpath(qa_dest),
+                os.path.realpath(os.path.join(root, "data", "results")),
+            )
+            self.assertEqual(
+                os.path.realpath(resolve_full_qa_dest(export)),
+                os.path.realpath(os.path.join(root, "data", "results")),
+            )
 
 
 if __name__ == "__main__":

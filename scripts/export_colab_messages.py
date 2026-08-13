@@ -42,6 +42,10 @@ def split_documentary_text(text: str) -> tuple[str, str]:
 
 
 def convert_file(source: Path, output: Path, expected_domain: str) -> dict:
+    if not source.is_file():
+        raise FileNotFoundError(
+            f"model-enrichment JSONL not found: {source}"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{output.name}.",
@@ -55,11 +59,18 @@ def convert_file(source: Path, output: Path, expected_domain: str) -> dict:
 
     try:
         with (
-            source.open("r", encoding="utf-8") as source_handle,
+            source.open("r", encoding="utf-8-sig") as source_handle,
             os.fdopen(descriptor, "w", encoding="utf-8") as output_handle,
         ):
             for line_number, line in enumerate(source_handle, 1):
-                record = json.loads(line)
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"{source}:{line_number}: invalid JSON: {exc}"
+                    ) from exc
                 if record.get("domain") != expected_domain:
                     raise ValueError(
                         f"{source}:{line_number}: unexpected domain "

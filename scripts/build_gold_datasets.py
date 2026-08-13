@@ -327,6 +327,23 @@ def source_support_from_sets(
     return 0, coverage
 
 
+def iter_jsonl_objects(path: Path, rejected: collections.Counter[str]):
+    """Yield ``(line_number, object)`` and count unreadable lines."""
+    with path.open(encoding="utf-8-sig") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                rejected["invalid_json"] += 1
+                continue
+            if not isinstance(item, dict):
+                rejected["invalid_json"] += 1
+                continue
+            yield line_number, item
+
+
 def build_pdf_index(pdf_root: Path) -> dict[str, Path]:
     index = {}
     for path in sorted(pdf_root.rglob("*")):
@@ -342,7 +359,9 @@ def load_pdf_source(
 ) -> tuple[str, str, Path] | None:
     if source_file in source_cache:
         normalized, digest = source_cache[source_file]
-        path = pdf_index[source_file.removesuffix(".md").casefold()]
+        path = pdf_index.get(source_file.removesuffix(".md").casefold())
+        if path is None:
+            return None
         return normalized, digest, path
     stem = source_file.removesuffix(".md").casefold()
     path = pdf_index.get(stem)
@@ -364,65 +383,63 @@ def cyber_candidates(
     rejected: collections.Counter[str] = collections.Counter()
     source_cache: dict[str, tuple[str, str]] = {}
     pdf_index = build_pdf_index(pdf_root)
-    with raw_path.open(encoding="utf-8") as handle:
-        for line_number, raw in enumerate(handle, 1):
-            row = json.loads(raw)
-            instruction = str(row.get("question", "")).strip()
-            response = str(row.get("answer", "")).strip()
-            source_file = str(row.get("_source_file", "")).strip()
-            family = source_family(source_file)
-            if family is None:
-                rejected["non_official_source"] += 1
-                continue
-            if SOURCE_FAMILY_LIMITS[family] == 0:
-                rejected["excluded_source_family"] += 1
-                continue
-            reasons = common_quality_reasons(instruction, response)
-            combined = f"{instruction}\n{response}"
-            if not CLEANER.CYBER_RE.search(combined):
-                reasons.append("weak_domain_signal")
-            loaded_source = load_pdf_source(source_file, pdf_index, source_cache)
-            if loaded_source is None:
-                reasons.append("source_file_missing")
-                support = 0
-                digest = None
-            else:
-                normalized_source, digest, source_path = loaded_source
-                support = source_support(instruction, response, normalized_source)
-                coverage = source_support_coverage(response, normalized_source)
-                if not support:
-                    reasons.append("not_textually_grounded")
-                if coverage < 0.30:
-                    reasons.append("low_textual_coverage")
-            if reasons:
-                for reason in set(reasons):
-                    rejected[reason] += 1
-                continue
-            category, domain_hits = category_for(combined, CYBER_CATEGORIES)
-            score = (
-                support * 25
-                + min(domain_hits, 5) * 4
-                + (10 if CONCEPTUAL_QUESTION_RE.search(instruction) else 0)
-                + (10 if 70 <= len(response) <= 450 else 0)
-                + (5 if 35 <= len(instruction) <= 140 else 0)
-                + round(coverage * 20)
+    for line_number, row in iter_jsonl_objects(raw_path, rejected):
+        instruction = str(row.get("question", "")).strip()
+        response = str(row.get("answer", "")).strip()
+        source_file = str(row.get("_source_file", "")).strip()
+        family = source_family(source_file)
+        if family is None:
+            rejected["non_official_source"] += 1
+            continue
+        if SOURCE_FAMILY_LIMITS[family] == 0:
+            rejected["excluded_source_family"] += 1
+            continue
+        reasons = common_quality_reasons(instruction, response)
+        combined = f"{instruction}\n{response}"
+        if not CLEANER.CYBER_RE.search(combined):
+            reasons.append("weak_domain_signal")
+        loaded_source = load_pdf_source(source_file, pdf_index, source_cache)
+        if loaded_source is None:
+            reasons.append("source_file_missing")
+            support = 0
+            digest = None
+        else:
+            normalized_source, digest, source_path = loaded_source
+            support = source_support(instruction, response, normalized_source)
+            coverage = source_support_coverage(response, normalized_source)
+            if not support:
+                reasons.append("not_textually_grounded")
+            if coverage < 0.30:
+                reasons.append("low_textual_coverage")
+        if reasons:
+            for reason in set(reasons):
+                rejected[reason] += 1
+            continue
+        category, domain_hits = category_for(combined, CYBER_CATEGORIES)
+        score = (
+            support * 25
+            + min(domain_hits, 5) * 4
+            + (10 if CONCEPTUAL_QUESTION_RE.search(instruction) else 0)
+            + (10 if 70 <= len(response) <= 450 else 0)
+            + (5 if 35 <= len(instruction) <= 140 else 0)
+            + round(coverage * 20)
+        )
+        candidates.append(
+            Candidate(
+                instruction=instruction,
+                response=response,
+                category=category,
+                score=score,
+                stable_key=stable_hash(instruction, response, source_file),
+                original_line=line_number,
+                source_file=source_file,
+                source_family=family,
+                source_sha256=digest,
+                support_level=support,
+                support_coverage=coverage,
+                source_path=str(source_path),
             )
-            candidates.append(
-                Candidate(
-                    instruction=instruction,
-                    response=response,
-                    category=category,
-                    score=score,
-                    stable_key=stable_hash(instruction, response, source_file),
-                    original_line=line_number,
-                    source_file=source_file,
-                    source_family=family,
-                    source_sha256=digest,
-                    support_level=support,
-                    support_coverage=coverage,
-                    source_path=str(source_path),
-                )
-            )
+        )
     return candidates, rejected
 
 
@@ -434,12 +451,10 @@ def finance_candidates(
     rejected: collections.Counter[str] = collections.Counter()
     rows_by_source: dict[str, list[tuple[int, dict]]] = collections.defaultdict(list)
     pdf_index = build_pdf_index(pdf_root)
-    with raw_path.open(encoding="utf-8") as handle:
-        for line_number, raw in enumerate(handle, 1):
-            row = json.loads(raw)
-            rows_by_source[str(row.get("_source_file", "")).strip()].append(
-                (line_number, row)
-            )
+    for line_number, row in iter_jsonl_objects(raw_path, rejected):
+        rows_by_source[str(row.get("_source_file", "")).strip()].append(
+            (line_number, row)
+        )
 
     for source_file, source_rows in rows_by_source.items():
         if not TRUSTED_FINANCE_SOURCE_RE.search(source_file):

@@ -4,6 +4,7 @@ import unittest
 
 from processing_manifest import (
     ProcessingManifest,
+    atomic_text_writer,
     atomic_write_text,
     output_paths,
     relative_source_id,
@@ -116,6 +117,17 @@ class ProcessingManifestTests(unittest.TestCase):
                     outputs=outputs,
                 )
             )
+
+    def test_atomic_text_writer_discards_partial_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "out.jsonl")
+            atomic_write_text(path, "keep\n")
+            with self.assertRaises(RuntimeError):
+                with atomic_text_writer(path) as handle:
+                    handle.write("partial\n")
+                    raise RuntimeError("boom")
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "keep\n")
 
 
 if __name__ == "__main__":

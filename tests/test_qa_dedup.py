@@ -4,14 +4,14 @@ import subprocess
 import sys
 import unittest
 
-from qa_generator import _get_ngrams, _lsh_buckets, _minhash_signature
+from qa_dedup import _get_ngrams, _lsh_buckets, _minhash_signature
 
 
 class QADeduplicationTests(unittest.TestCase):
     def test_minhash_is_independent_from_python_hash_seed(self):
         code = (
             "import json;"
-            "from qa_generator import _get_ngrams,_minhash_signature,_lsh_buckets;"
+            "from qa_dedup import _get_ngrams,_minhash_signature,_lsh_buckets;"
             "s=_minhash_signature(_get_ngrams('deterministic question'),8);"
             "print(json.dumps([s,_lsh_buckets(s,2)]))"
         )
@@ -35,6 +35,11 @@ class QADeduplicationTests(unittest.TestCase):
             _lsh_buckets(signature, 4),
             _lsh_buckets(signature, 4),
         )
+
+    def test_empty_shingles_do_not_crash_lsh(self):
+        signature = _minhash_signature(set(), 8)
+        self.assertEqual(len(signature), 8)
+        self.assertEqual(_lsh_buckets(signature, 2), _lsh_buckets(signature, 2))
 
 
 if __name__ == "__main__":

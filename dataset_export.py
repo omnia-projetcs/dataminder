@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Iterable, Iterator
 
-from processing_manifest import atomic_write_text
+from processing_manifest import atomic_text_writer
 
 
 def cleaned_jsonl_path(input_file: str) -> str:
@@ -16,21 +17,62 @@ def cleaned_jsonl_path(input_file: str) -> str:
     return f"{input_file}_cleaned.jsonl"
 
 
-def _iter_alpaca_records(raw: str):
-    stripped = raw.lstrip()
-    if stripped.startswith("["):
-        data = json.loads(stripped)
-        if not isinstance(data, list):
-            raise ValueError("expected a JSON list of Alpaca records")
-        yield from data
+def iter_alpaca_records(source) -> Iterator[dict]:
+    """Yield Alpaca records from a list, JSON array file, or JSONL file."""
+    if isinstance(source, list):
+        for item in source:
+            if isinstance(item, dict):
+                yield item
         return
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
+
+    with open(source, "r", encoding="utf-8-sig") as handle:
+        while True:
+            position = handle.tell()
+            char = handle.read(1)
+            if not char:
+                return
+            if not char.isspace():
+                handle.seek(position)
+                break
+        if char == "[":
+            data = json.load(handle)
+            if not isinstance(data, list):
+                raise ValueError("expected a JSON list of Alpaca records")
+            for item in data:
+                if isinstance(item, dict):
+                    yield item
+            return
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                yield item
+
+
+def _normalized_record(item: dict) -> dict | None:
+    instruction = str(item.get("instruction") or "").strip()
+    output = str(item.get("output") or "").strip()
+    input_val = str(item.get("input") or "").strip()
+    if not instruction or not output:
+        return None
+    return {
+        "instruction": instruction,
+        "input": input_val,
+        "output": output,
+    }
+
+
+def _write_jsonl(path: str, records: Iterable[dict]) -> int:
+    count = 0
+    with atomic_text_writer(path) as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            count += 1
+    return count
 
 
 def format_hf_text(instruction: str, input_value: str, output: str) -> str:
@@ -45,59 +87,33 @@ def format_hf_text(instruction: str, input_value: str, output: str) -> str:
 
 def clean_dataset(data_or_filepath, output_file=None):
     """Write a validated Alpaca JSONL file (one object per line)."""
-    data = None
-    input_desc = ""
-
     if isinstance(data_or_filepath, str):
-        input_file = data_or_filepath
-        if not os.path.exists(input_file):
-            print(f"Clean dataset skipped: file not found: {input_file}")
+        if not os.path.exists(data_or_filepath):
+            print(f"Clean dataset skipped: file not found: {data_or_filepath}")
             return None
-        input_desc = input_file
+        input_desc = data_or_filepath
+        source = data_or_filepath
         if output_file is None:
-            output_file = cleaned_jsonl_path(input_file)
-        try:
-            with open(input_file, "r", encoding="utf-8") as infile:
-                data = json.load(infile)
-        except Exception as e:
-            print(f"Could not read '{input_file}': {e}")
-            return None
+            output_file = cleaned_jsonl_path(data_or_filepath)
     elif isinstance(data_or_filepath, list):
-        data = data_or_filepath
         input_desc = "in-memory list"
+        source = data_or_filepath
         if output_file is None:
             output_file = "dataset_cleaned.jsonl"
     else:
         print(f"Invalid data type for clean_dataset: {type(data_or_filepath)}")
         return None
 
-    if not isinstance(data, list):
-        print(f"Unexpected format in '{input_desc}': expected a JSON list.")
-        return None
-
     print(f"Cleaning dataset '{input_desc}' -> '{output_file}'...")
 
     try:
-        lines = []
-        for item in data:
-            if isinstance(item, dict):
-                instruction = str(item.get("instruction") or "").strip()
-                output = str(item.get("output") or "").strip()
-                input_val = str(item.get("input") or "").strip()
-
-                if instruction and output:
-                    clean_entry = {
-                        "instruction": instruction,
-                        "input": input_val,
-                        "output": output,
-                    }
-                    lines.append(json.dumps(clean_entry, ensure_ascii=False))
-
-        atomic_write_text(
-            output_file,
-            "\n".join(lines) + ("\n" if lines else ""),
+        records = (
+            cleaned
+            for item in iter_alpaca_records(source)
+            if (cleaned := _normalized_record(item)) is not None
         )
-        print(f"Wrote {len(lines)} valid lines to '{output_file}'")
+        count = _write_jsonl(output_file, records)
+        print(f"Wrote {count} valid lines to '{output_file}'")
         return output_file
     except Exception as e:
         print(f"Could not clean '{input_desc}': {e}")
@@ -120,24 +136,21 @@ def prepare_hf_dataset(input_file, output_file=None):
     print(f"Preparing Hugging Face export '{input_file}' -> '{output_file}'...")
 
     try:
-        with open(input_file, "r", encoding="utf-8") as infile:
-            raw = infile.read()
-        lines = []
-        for data in _iter_alpaca_records(raw):
-            if not isinstance(data, dict):
-                continue
-            inst = str(data.get("instruction") or "").strip()
-            inp = str(data.get("input") or "").strip()
-            out = str(data.get("output") or "").strip()
-            if not inst or not out:
-                continue
-            lines.append(json.dumps({"text": format_hf_text(inst, inp, out)}, ensure_ascii=False))
+        def records():
+            for item in iter_alpaca_records(input_file):
+                cleaned = _normalized_record(item)
+                if cleaned is None:
+                    continue
+                yield {
+                    "text": format_hf_text(
+                        cleaned["instruction"],
+                        cleaned["input"],
+                        cleaned["output"],
+                    )
+                }
 
-        atomic_write_text(
-            output_file,
-            "\n".join(lines) + ("\n" if lines else ""),
-        )
-        print(f"Wrote Hugging Face file '{output_file}' ({len(lines)} examples).")
+        count = _write_jsonl(output_file, records())
+        print(f"Wrote Hugging Face file '{output_file}' ({count} examples).")
         return output_file
     except Exception as e:
         print(f"Could not prepare Hugging Face export for '{input_file}': {e}")

@@ -115,6 +115,23 @@ class LLMClientGenerationTests(unittest.TestCase):
         self.assertIsNot(first, third)
         self.assertEqual(len(client._sessions), 1)
 
+    def test_empty_ollama_response_is_retried_then_fails(self):
+        client = LLMClient(provider="ollama")
+        session = _Session(_Response({"message": {"content": "   "}}))
+        with patch.object(client, "_session", return_value=session):
+            with patch("llm_client.time.sleep"):
+                with self.assertRaises(RuntimeError):
+                    client.chat("model", [{"role": "user", "content": "question"}])
+        self.assertEqual(len(session.calls), 3)
+
+    def test_vllm_missing_choices_is_an_error(self):
+        client = LLMClient(provider="vllm")
+        client._vllm_endpoint = "chat"
+        session = _Session(_Response({"choices": []}))
+        with patch.object(client, "_session", return_value=session):
+            with self.assertRaises(RuntimeError):
+                client._chat_vllm("user-model", [{"role": "user", "content": "q"}])
+
 
 if __name__ == "__main__":
     unittest.main()

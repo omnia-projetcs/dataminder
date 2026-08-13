@@ -180,6 +180,8 @@ def extract_epub(path: Path) -> ExtractedDocument:
             except Exception as exc:
                 diagnostics.append(f"{member}: {exc}")
                 continue
+            for tag in soup(["script", "style", "noscript", "template"]):
+                tag.decompose()
             heading = soup.find(["h1", "h2", "h3", "title"])
             section = clean_text(heading.get_text(" ", strip=True)) if heading else item_id
             text = clean_text(soup.get_text("\n", strip=True))
@@ -220,8 +222,18 @@ def split_markdown_sections(text: str, method: str) -> list[TextUnit]:
     return units
 
 
+def _read_text_file(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
 def extract_plain(path: Path) -> ExtractedDocument:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = _read_text_file(path)
     return ExtractedDocument(
         title=path.stem,
         units=split_markdown_sections(text, "plain-text"),
@@ -237,6 +249,7 @@ def extract_doc(path: Path) -> ExtractedDocument:
         capture_output=True,
         text=True,
         check=True,
+        timeout=120,
     )
     return ExtractedDocument(
         title=path.stem,
@@ -331,11 +344,13 @@ def chunk_windows(
     while start < len(text):
         end = min(len(text), start + max_chars)
         if end < len(text):
-            split_at = max(
-                text.rfind("\n\n", start, end),
-                text.rfind(". ", start, end),
-                text.rfind(" ", start, end),
-            )
+            split_at = text.rfind("\n\n", start, end)
+            if split_at <= start:
+                split_at = text.rfind(". ", start, end)
+            if split_at <= start:
+                split_at = text.rfind("\n", start, end)
+            if split_at <= start:
+                split_at = text.rfind(" ", start, end)
             if split_at > start + max_chars // 2:
                 end = split_at + (2 if text[split_at:split_at + 2] == ". " else 0)
         part = clean_text(text[start:end])

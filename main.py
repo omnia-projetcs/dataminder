@@ -48,9 +48,13 @@ def process_documents(
     if llm_client is None:
         llm_client = LLMClient(provider="ollama")
 
-    if not os.path.exists(source_dir):
-        print(f"Source directory '{source_dir}' does not exist. Creating it now...")
-        os.makedirs(source_dir, exist_ok=True)
+    if not os.path.isdir(source_dir):
+        print(f"Source directory '{source_dir}' does not exist.")
+        os.makedirs(dest_dir, exist_ok=True)
+        resolved_report_path = report_path or os.path.join(dest_dir, DEFAULT_RUN_REPORT)
+        run_report = PipelineRunReport(source_dir, dest_dir)
+        run_report.set_configuration({"error": f"missing source directory: {source_dir}"})
+        return run_report.write(resolved_report_path)
 
     os.makedirs(dest_dir, exist_ok=True)
     resolved_report_path = report_path or os.path.join(dest_dir, DEFAULT_RUN_REPORT)
@@ -141,6 +145,44 @@ def process_documents(
         print(f"Using {num_threads} threads for parallel chunk processing.")
     
     pbar = tqdm(work_items, desc="Processing", unit="doc")
+    try:
+        _process_document_items(
+            pbar,
+            dest_dir=dest_dir,
+            model_name=model_name,
+            level=level,
+            llm_client=llm_client,
+            num_threads=num_threads,
+            structured=structured,
+            parser_backend=parser_backend,
+            marker_mode=marker_mode,
+            pipeline_config=pipeline_config,
+            pipeline_fingerprint=pipeline_fingerprint,
+            manifest=manifest,
+            run_report=run_report,
+        )
+    finally:
+        llm_client.unload_model(model_name)
+        report = run_report.write(resolved_report_path)
+    return report
+
+
+def _process_document_items(
+    pbar,
+    *,
+    dest_dir,
+    model_name,
+    level,
+    llm_client,
+    num_threads,
+    structured,
+    parser_backend,
+    marker_mode,
+    pipeline_config,
+    pipeline_fingerprint,
+    manifest,
+    run_report,
+):
     for input_path, source_id, source_sha256, outputs in pbar:
         filename = os.path.basename(input_path)
         document_started = time.perf_counter()
@@ -208,15 +250,20 @@ def process_documents(
                             futures[future] = idx
                         
                         completed = 0
-                        for future in as_completed(futures):
-                            idx = futures[future]
-                            chunk_sum, elapsed = future.result()
-                            chunk_times.append(elapsed)
-                            completed += 1
-                            avg_so_far = f" | avg={sum(chunk_times)/len(chunk_times):.1f}s" if chunk_times else ""
-                            pbar.set_postfix({"file": filename[:20], "step": f"AI Sum {completed}/{len(futures)}{avg_so_far}"})
-                            if chunk_sum:
-                                summaries_by_idx[idx] = chunk_sum
+                        try:
+                            for future in as_completed(futures):
+                                idx = futures[future]
+                                chunk_sum, elapsed = future.result()
+                                chunk_times.append(elapsed)
+                                completed += 1
+                                avg_so_far = f" | avg={sum(chunk_times)/len(chunk_times):.1f}s" if chunk_times else ""
+                                pbar.set_postfix({"file": filename[:20], "step": f"AI Sum {completed}/{len(futures)}{avg_so_far}"})
+                                if chunk_sum:
+                                    summaries_by_idx[idx] = chunk_sum
+                        except Exception:
+                            for pending in futures:
+                                pending.cancel()
+                            raise
                     
                     # Reassemble in original order
                     summaries = [summaries_by_idx[i] for i in sorted(summaries_by_idx.keys())]
@@ -243,6 +290,10 @@ def process_documents(
                     avg_t = total_t / len(chunk_times) if chunk_times else 0
                     pbar.set_postfix({"file": filename[:20], "step": "Done", "avg": f"{avg_t:.1f}s/chunk"})
             summary_elapsed = time.perf_counter() - summary_started
+            if level != 0 and not summary_md.strip():
+                raise RuntimeError(
+                    "Summarization produced no usable text; refusing to cache an empty output."
+                )
             
             pbar.set_postfix({"file": filename[:20], "step": "Saving"})
             atomic_write_text(outputs["markdown"], summary_md)
@@ -298,10 +349,6 @@ def process_documents(
                 ),
             )
             continue
-
-    # Unload model from VRAM now that processing is complete (Ollama only)
-    llm_client.unload_model(model_name)
-    return run_report.write(resolved_report_path)
 
 
 def _summarize_chunk_timed(chunk, model_name, level, llm_client):
@@ -443,6 +490,24 @@ def default_finance_source(project_root):
     if external.is_dir() or not local.is_dir():
         return str(external)
     return str(local)
+
+
+def resolve_qa_io_paths(source, dest, *, project_root=None):
+    """Map CLI source/dest onto Q&A input/output, ignoring path spelling."""
+    root = Path(project_root or Path.cwd()).resolve()
+    default_source = (root / "data" / "source").resolve()
+    default_export = (root / "data" / "export").resolve()
+    default_results = root / "data" / "results"
+    source_path = Path(source).resolve()
+    dest_path = Path(dest).resolve()
+    qa_source = default_export if source_path == default_source else source_path
+    qa_dest = default_results if dest_path == default_export else dest_path
+    return str(qa_source), str(qa_dest)
+
+
+def resolve_full_qa_dest(dest):
+    """Write --full Q&A next to the summary directory (export → results)."""
+    return str(Path(dest).resolve().parent / "results")
 
 
 if __name__ == "__main__":
@@ -707,7 +772,7 @@ if __name__ == "__main__":
         )
         
         print("\n[Step 2/2] Q&A Dataset Generation")
-        qa_dest = os.path.join("data", "results")
+        qa_dest = resolve_full_qa_dest(args.dest)
         generate_qa_dataset(
             args.dest,
             qa_dest,
@@ -726,10 +791,9 @@ if __name__ == "__main__":
         print("--- Starting Q&A Dataset Generation ---")
         
         # In QA mode: source defaults to data/export (summaries), dest to data/results
-        default_source = os.path.join("data", "source")
-        default_dest = os.path.join("data", "export")
-        qa_source = default_dest if args.source == default_source else args.source
-        qa_dest = os.path.join("data", "results") if args.dest == default_dest else args.dest
+        qa_source, qa_dest = resolve_qa_io_paths(
+            args.source, args.dest, project_root=project_root
+        )
         
         generate_qa_dataset(
             qa_source,
@@ -746,14 +810,16 @@ if __name__ == "__main__":
         from qa_generator import _enrich_after_dedup
         print("--- Starting Standalone Enrichment ---")
         
-        results_dir = os.path.join("data", "results")
+        _, results_dir = resolve_qa_io_paths(
+            args.source, args.dest, project_root=project_root
+        )
         dataset_path = os.path.join(results_dir, "dataset_qa.json")
         enriched_path = os.path.join(results_dir, "dataset_qa_enriched.json")
         
         if not os.path.exists(dataset_path):
             print(f"ERROR: {dataset_path} not found. Run --qa or --full first to generate the dataset.")
         else:
-            with open(dataset_path, 'r', encoding='utf-8') as f:
+            with open(dataset_path, 'r', encoding='utf-8-sig') as f:
                 qa_list = json.load(f)
             print(f"Loaded {len(qa_list)} entries from {dataset_path}")
             

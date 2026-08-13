@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 import tempfile
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 
 MANIFEST_FILENAME = ".dataminder-manifest.json"
@@ -34,14 +35,15 @@ def output_paths(path: str, source_dir: str, dest_dir: str) -> dict[str, str]:
     }
 
 
-def atomic_write_text(path: str, content: str) -> None:
-    """Atomically replace a UTF-8 text file in its destination directory."""
+@contextmanager
+def atomic_text_writer(path: str) -> Iterator:
+    """Yield a UTF-8 writer that replaces *path* only after a successful close."""
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     descriptor, temporary_path = tempfile.mkstemp(prefix=".dataminder-", dir=directory)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            output.write(content)
+            yield output
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary_path, path)
@@ -51,6 +53,12 @@ def atomic_write_text(path: str, content: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def atomic_write_text(path: str, content: str) -> None:
+    """Atomically replace a UTF-8 text file in its destination directory."""
+    with atomic_text_writer(path) as output:
+        output.write(content)
 
 
 class ProcessingManifest:

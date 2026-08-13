@@ -8,14 +8,14 @@ import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-import difflib
-import time
-import random
 from llm_client import LLMClient
 from logger import log_error as _log_error
 from document_ir import sha256_file
 from processing_manifest import atomic_write_text, relative_source_id, stable_fingerprint
 from dataset_export import clean_dataset, prepare_hf_dataset
+from json_repair import _try_parse_json
+from qa_enrichment import _enrich_after_dedup
+from qa_dedup import deduplicate_qa
 
 
 CHUNK_SIZE = 5000
@@ -57,7 +57,9 @@ def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
     start = 0
     while start < len(text):
         if len(text) - start <= chunk_size:
-            chunks.append(text[start:])
+            tail = text[start:].strip()
+            if tail:
+                chunks.append(tail)
             break
 
         # Try to find a paragraph break to split cleanly
@@ -78,12 +80,12 @@ def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
 def _read_qa_input_chunks(input_path, input_format):
     """Return ``(text, provenance)`` chunks from summaries or RAG JSONL."""
     if input_format == "summaries":
-        with open(input_path, "r", encoding="utf-8") as source:
+        with open(input_path, "r", encoding="utf-8-sig") as source:
             text = source.read()
         return [(chunk, {}) for chunk in _split_into_chunks(text)]
 
     chunks = []
-    with open(input_path, "r", encoding="utf-8") as source:
+    with open(input_path, "r", encoding="utf-8-sig") as source:
         for line_number, line in enumerate(source, start=1):
             if not line.strip():
                 continue
@@ -166,353 +168,6 @@ def _is_junk_qa(qa, min_alpha_ratio=0.40, min_question_len=10, min_answer_len=10
 def log_error(filepath, error_msg):
     _log_error(filepath, error_msg, category="QA GENERATION")
 
-def _sanitize_json_string(raw_json):
-    """Sanitize a JSON string that may contain literal control characters
-    (newlines, tabs, etc.) inside string values, which is invalid JSON.
-    This replaces unescaped control characters with their escape sequences."""
-    # Replace literal control characters that break JSON parsing
-    # We need to be careful: \n that is already escaped (\\n in the raw string) should stay.
-    # Strategy: process character by character tracking if we're inside a JSON string value.
-    
-    result = []
-    in_string = False
-    i = 0
-    while i < len(raw_json):
-        ch = raw_json[i]
-        
-        if ch == '\\' and in_string and i + 1 < len(raw_json):
-            # Escaped character inside a string — keep both characters as-is
-            result.append(ch)
-            result.append(raw_json[i + 1])
-            i += 2
-            continue
-        
-        if ch == '"':
-            in_string = not in_string
-            result.append(ch)
-            i += 1
-            continue
-        
-        if in_string:
-            # Replace literal control characters with their JSON escape sequences
-            if ch == '\n':
-                result.append('\\n')
-            elif ch == '\r':
-                result.append('\\r')
-            elif ch == '\t':
-                result.append('\\t')
-            elif ord(ch) < 32:
-                result.append(f'\\u{ord(ch):04x}')
-            else:
-                result.append(ch)
-        else:
-            result.append(ch)
-        
-        i += 1
-    
-    return ''.join(result)
-
-
-def _extract_balanced_json_array(content):
-    """Return the first top-level JSON array, ignoring brackets inside strings."""
-    start = content.find("[")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    i = start
-    while i < len(content):
-        ch = content[i]
-        if ch == "\\" and in_str:
-            i += 2
-            continue
-        if ch == '"':
-            in_str = not in_str
-        elif not in_str:
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    return content[start : i + 1]
-        i += 1
-    return None
-
-
-def _try_parse_json(content):
-    """Try multiple strategies to extract a JSON array from LLM output."""
-    
-    # Strategy 1: Extract JSON from markdown code block ```json ... ```
-    code_block_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
-    if code_block_match:
-        json_str = code_block_match.group(1)
-        sanitized = _sanitize_json_string(json_str)
-        try:
-            return json.loads(sanitized)
-        except json.JSONDecodeError:
-            pass
-    
-    # Strategy 2: First balanced [...] array (avoids swallowing later brackets)
-    json_str = _extract_balanced_json_array(content)
-    if json_str:
-        sanitized = _sanitize_json_string(json_str)
-        try:
-            return json.loads(sanitized)
-        except json.JSONDecodeError:
-            pass
-    
-    # Strategy 3: Try direct parse of the full content
-    sanitized = _sanitize_json_string(content)
-    try:
-        return json.loads(sanitized)
-    except json.JSONDecodeError:
-        pass
-    
-    # Strategy 4: Line-by-line recovery — extract individual {"question":..., "answer":...} objects
-    pairs = []
-    for obj_match in re.finditer(r'\{[^{}]*?"question"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"answer"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}', content, re.DOTALL):
-        try:
-            q = obj_match.group(1).replace('\\n', ' ').replace('\\t', ' ').strip()
-            a = obj_match.group(2).replace('\\n', ' ').replace('\\t', ' ').strip()
-            if q and a:
-                pairs.append({"question": q, "answer": a})
-        except Exception:
-            continue
-    
-    return pairs if pairs else None
-
-
-def _try_parse_enrichment_json(content):
-    """Try multiple strategies to extract a JSON object with 'input' and 'output' keys from LLM output."""
-
-    def _attempt_parse(json_str):
-        """Try parsing with sanitization and invalid-escape recovery."""
-        # First try with sanitization
-        sanitized = _sanitize_json_string(json_str)
-        try:
-            return json.loads(sanitized)
-        except json.JSONDecodeError:
-            pass
-        # Fallback: strip invalid backslash escapes (e.g. \S, \x without valid hex, etc.)
-        cleaned = re.sub(r'\\(?!["\\\\bfnrtu])', r'\\\\', sanitized)
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            pass
-        # Fallback 2: aggressively strip ALL backslash sequences that aren't standard JSON escapes
-        aggressive = re.sub(r'\\(?!["\\\\bfnrtu/])', '', sanitized)
-        try:
-            return json.loads(aggressive)
-        except json.JSONDecodeError:
-            pass
-        return None
-
-    def _attempt_parse_truncated(json_str):
-        """Try to repair and parse truncated JSON by closing open structures."""
-        # Try the normal parse first
-        result = _attempt_parse(json_str)
-        if result is not None:
-            return result
-
-        # Attempt to close truncated JSON: track open braces/brackets/strings
-        sanitized = _sanitize_json_string(json_str)
-        # Strip trailing incomplete string values (e.g. cut mid-sentence)
-        # Try progressively trimming from the end to find a parseable prefix
-        for trim_target in ['\n', '.', ',', ' ']:
-            last_pos = sanitized.rfind(trim_target)
-            while last_pos > len(sanitized) // 2:
-                candidate = sanitized[:last_pos]
-                # Close any open string
-                if candidate.count('"') % 2 != 0:
-                    candidate += '"'
-                # Close open braces/brackets
-                open_braces = candidate.count('{') - candidate.count('}')
-                open_brackets = candidate.count('[') - candidate.count(']')
-                candidate += ']' * max(0, open_brackets)
-                candidate += '}' * max(0, open_braces)
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    pass
-                # Also try with aggressive escape stripping
-                aggressive = re.sub(r'\\(?!["\\\\bfnrtu/])', '', candidate)
-                try:
-                    return json.loads(aggressive)
-                except json.JSONDecodeError:
-                    pass
-                last_pos = sanitized.rfind(trim_target, 0, last_pos)
-        return None
-
-    def _validate_enrichment(result):
-        """Check that a parsed dict has usable 'input' and 'output' keys."""
-        if not isinstance(result, dict):
-            return None
-        if "input" in result and "output" in result:
-            return result
-        # Sometimes the LLM nests the data one level deep (e.g. {"result": {"input": ..., "output": ...}})
-        for v in result.values():
-            if isinstance(v, dict) and "input" in v and "output" in v:
-                return v
-        return None
-
-    # Strategy 1: Extract JSON from markdown code block ```json ... ``` (non-greedy for inner braces)
-    code_block_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', content, re.DOTALL)
-    if code_block_match:
-        result = _attempt_parse(code_block_match.group(1))
-        validated = _validate_enrichment(result)
-        if validated:
-            return validated
-
-    # Strategy 1b: Strip opening ```json fence when closing ``` is missing (truncated response)
-    fence_open_match = re.search(r'```(?:json)?\s*(\{.*)', content, re.DOTALL)
-    if fence_open_match:
-        stripped = fence_open_match.group(1).rstrip('`').rstrip()
-        result = _attempt_parse(stripped)
-        validated = _validate_enrichment(result)
-        if validated:
-            return validated
-        # Try truncated repair on the fence-stripped content
-        result = _attempt_parse_truncated(stripped)
-        validated = _validate_enrichment(result)
-        if validated:
-            return validated
-
-    # Strategy 2: Find outermost { ... } with balanced brace matching (skip braces inside strings)
-    start = content.find('{')
-    if start != -1:
-        depth = 0
-        end = start
-        in_str = False
-        i = start
-        while i < len(content):
-            ch = content[i]
-            if ch == '\\' and in_str:
-                i += 2  # skip escaped char
-                continue
-            if ch == '"':
-                in_str = not in_str
-            elif not in_str:
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-            i += 1
-        if end > start:
-            result = _attempt_parse(content[start:end])
-            validated = _validate_enrichment(result)
-            if validated:
-                return validated
-
-    # Strategy 3: Simple first-{-to-last-} extraction (fallback for nested issues)
-    last = content.rfind('}')
-    if start != -1 and last >= start:
-        result = _attempt_parse(content[start:last + 1])
-        validated = _validate_enrichment(result)
-        if validated:
-            return validated
-
-    # Strategy 4: Regex extraction of individual fields when JSON structure is broken
-    # Try to find "input" and "output" values even if the overall JSON is malformed
-    input_match = re.search(r'"input"\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.DOTALL)
-    output_match = re.search(r'"output"\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.DOTALL)
-    if input_match and output_match:
-        try:
-            inp = input_match.group(1).replace('\\n', '\n').replace('\\t', ' ')
-            out = output_match.group(1).replace('\\n', '\n').replace('\\t', ' ')
-            if inp.strip() and out.strip():
-                return {"input": inp, "output": out}
-        except Exception:
-            pass
-
-    # Strategy 5: "output" might be a nested JSON object rather than a string
-    if input_match:
-        output_obj_match = re.search(r'"output"\s*:\s*(\{.*)', content, re.DOTALL)
-        if output_obj_match:
-            obj_str = output_obj_match.group(1)
-            # Find balanced braces
-            depth = 0
-            for i, ch in enumerate(obj_str):
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        result = _attempt_parse(obj_str[:i+1])
-                        if isinstance(result, dict):
-                            inp = input_match.group(1).replace('\\n', '\n').replace('\\t', ' ')
-                            return {"input": inp, "output": result}
-                        break
-
-    # Strategy 6: "input" is a nested JSON object (not a string), "output" may also be nested
-    input_obj_match = re.search(r'"input"\s*:\s*(\{)', content, re.DOTALL)
-    if input_obj_match:
-        # Extract balanced input object
-        obj_start = input_obj_match.start(1)
-        depth = 0
-        in_s = False
-        inp_end = obj_start
-        j = obj_start
-        while j < len(content):
-            ch = content[j]
-            if ch == '\\' and in_s:
-                j += 2
-                continue
-            if ch == '"':
-                in_s = not in_s
-            elif not in_s:
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        inp_end = j + 1
-                        break
-            j += 1
-        if inp_end > obj_start:
-            inp_result = _attempt_parse(content[obj_start:inp_end])
-            if isinstance(inp_result, dict):
-                # Now find "output" after input
-                remainder = content[inp_end:]
-                out_obj_match = re.search(r'"output"\s*:\s*(\{)', remainder, re.DOTALL)
-                if out_obj_match:
-                    out_start = out_obj_match.start(1)
-                    depth = 0
-                    in_s = False
-                    out_end = out_start
-                    k = out_start
-                    while k < len(remainder):
-                        ch = remainder[k]
-                        if ch == '\\' and in_s:
-                            k += 2
-                            continue
-                        if ch == '"':
-                            in_s = not in_s
-                        elif not in_s:
-                            if ch == '{':
-                                depth += 1
-                            elif ch == '}':
-                                depth -= 1
-                                if depth == 0:
-                                    out_end = k + 1
-                                    break
-                        k += 1
-                    if out_end > out_start:
-                        out_result = _attempt_parse(remainder[out_start:out_end])
-                        if out_result is not None:
-                            return {"input": inp_result, "output": out_result}
-
-    # Strategy 7: Last resort — truncated JSON repair on the full content from first {
-    if start != -1:
-        result = _attempt_parse_truncated(content[start:])
-        validated = _validate_enrichment(result)
-        if validated:
-            return validated
-
-    return None
-
 
 def generate_qa_from_text(text, model_name="gemma3:4b-it-q4_K_M", source_file="N/A", llm_client=None):
     if llm_client is None:
@@ -585,123 +240,6 @@ def _references_source_material(qa):
     text = qa.get('question', '') + ' ' + qa.get('answer', '')
     return bool(_SOURCE_REF_PATTERNS.search(text))
 
-def _get_ngrams(text, n=3):
-    """Generate character n-grams (shingles) from text."""
-    text = text.lower().strip()
-    if len(text) < n:
-        return {text}
-    return {text[i:i+n] for i in range(len(text) - n + 1)}
-
-
-def _minhash_signature(shingles, num_hashes=64):
-    """Compute a reproducible MinHash signature for a set of shingles.
-
-    Python's built-in string hash is randomized between processes, which made
-    the LSH candidate set vary between runs. BLAKE2 creates stable base hashes;
-    SplitMix64-style mixing cheaply derives deterministic permutations.
-    """
-    mask = 0xFFFFFFFFFFFFFFFF
-    base_hashes = [
-        int.from_bytes(
-            hashlib.blake2b(shingle.encode("utf-8"), digest_size=8).digest(),
-            "big",
-        )
-        for shingle in shingles
-    ]
-    signature = []
-    for i in range(num_hashes):
-        min_hash = float('inf')
-        seed = (0x9E3779B97F4A7C15 * (i + 1)) & mask
-        for base_hash in base_hashes:
-            h = (base_hash + seed) & mask
-            h = ((h ^ (h >> 30)) * 0xBF58476D1CE4E5B9) & mask
-            h = ((h ^ (h >> 27)) * 0x94D049BB133111EB) & mask
-            h ^= h >> 31
-            if h < min_hash:
-                min_hash = h
-        signature.append(min_hash)
-    return tuple(signature)
-
-
-def _lsh_buckets(signature, num_bands=16):
-    """Split a MinHash signature into bands for LSH bucketing."""
-    band_size = len(signature) // num_bands
-    bands = []
-    for i in range(num_bands):
-        band = signature[i * band_size:(i + 1) * band_size]
-        payload = b"".join(value.to_bytes(8, "big") for value in band)
-        bands.append(
-            int.from_bytes(
-                hashlib.blake2b(payload, digest_size=8).digest(),
-                "big",
-            )
-        )
-    return bands
-
-
-def deduplicate_qa(qa_list, threshold=0.85):
-    if not qa_list:
-        return []
-
-    num_hashes = 64
-    num_bands = 16
-
-    # Phase 1: Exact dedup via normalized text hash
-    seen_exact = {}
-    deduped_exact = []
-    for qa in qa_list:
-        key = qa.get("question", "").lower().strip()
-        if key not in seen_exact:
-            seen_exact[key] = True
-            deduped_exact.append(qa)
-
-    exact_removed = len(qa_list) - len(deduped_exact)
-    if exact_removed:
-        tqdm.write(f"  Removed {exact_removed} exact duplicates.")
-
-    # Phase 2: Build MinHash signatures + LSH index (cached)
-    print(f"  Building similarity index for {len(deduped_exact)} pairs...")
-    signatures = []
-    all_bands = []  # pre-cache LSH bands to avoid recomputing in phase 3
-    for qa in tqdm(deduped_exact, desc="Indexing", unit="pair"):
-        shingles = _get_ngrams(qa.get("question", ""), n=3)
-        sig = _minhash_signature(shingles, num_hashes)
-        signatures.append(sig)
-        all_bands.append(_lsh_buckets(sig, num_bands))
-
-    # Build LSH band buckets: (band_idx, band_hash) -> list of indices
-    band_buckets = defaultdict(list)
-    for idx, bands in enumerate(all_bands):
-        for band_idx, band_hash in enumerate(bands):
-            band_buckets[(band_idx, band_hash)].append(idx)
-
-    # Phase 3: For each pair, check only LSH candidates with SequenceMatcher
-    removed = set()
-    for idx in tqdm(range(len(deduped_exact)), desc="Deduplicating", unit="pair"):
-        if idx in removed:
-            continue
-
-        # Collect candidate indices from shared LSH bands (using cached bands)
-        candidates = set()
-        for band_idx, band_hash in enumerate(all_bands[idx]):
-            for cand_idx in band_buckets[(band_idx, band_hash)]:
-                if cand_idx > idx and cand_idx not in removed:
-                    candidates.add(cand_idx)
-
-        if not candidates:
-            continue
-
-        q_text = deduped_exact[idx].get("question", "").lower()
-        for cand_idx in candidates:
-            if cand_idx in removed:
-                continue
-            cand_text = deduped_exact[cand_idx].get("question", "").lower()
-            if difflib.SequenceMatcher(None, q_text, cand_text).ratio() > threshold:
-                removed.add(cand_idx)
-
-    unique_qa = [qa for idx, qa in enumerate(deduped_exact) if idx not in removed]
-    return unique_qa
-
 def _load_already_processed(raw_path, pipeline_fingerprint):
     """Read the raw JSONL file and return chunk-level resume state.
 
@@ -712,7 +250,7 @@ def _load_already_processed(raw_path, pipeline_fingerprint):
     done = defaultdict(dict)
     if not os.path.exists(raw_path):
         return done
-    with open(raw_path, 'r', encoding='utf-8') as f:
+    with open(raw_path, 'r', encoding='utf-8-sig') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -744,7 +282,7 @@ def _load_raw_pairs(
     pairs = []
     if not os.path.exists(raw_path):
         return pairs
-    with open(raw_path, 'r', encoding='utf-8') as f:
+    with open(raw_path, 'r', encoding='utf-8-sig') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -846,8 +384,8 @@ def _run_qa_dataset(
     qa_pipeline_fingerprint = stable_fingerprint(qa_pipeline_config)
 
     if not os.path.exists(source_dir):
-        print(f"Source directory '{source_dir}' does not exist. Creating it now...")
-        os.makedirs(source_dir, exist_ok=True)
+        print(f"Source directory '{source_dir}' does not exist.")
+        return
 
     os.makedirs(dest_dir, exist_ok=True)
     
@@ -1069,17 +607,29 @@ def _run_qa_dataset(
 
                         completed = 0
                         for future in as_completed(futures):
+                            if _shutdown_requested:
+                                for pending in futures:
+                                    pending.cancel()
                             chunk_idx = futures[future]
                             completed += 1
                             processed_chunks += 1
                             pbar.set_postfix({"file": filename[:20], "chunk": f"{completed}/{len(futures)}", "q_saved": total_saved})
                             try:
+                                if future.cancelled():
+                                    continue
                                 chunk_pairs = future.result()
                                 _flush_chunk_pairs(chunk_pairs, chunk_idx)
                             except Exception as e:
                                 chunk_errors += 1
                                 log_error(input_path, f"Chunk {chunk_idx}: {e}")
                                 tqdm.write(f"  [{filename}] chunk {chunk_idx} error: {e}")
+                            if _shutdown_requested:
+                                tqdm.write(f"\n  [SHUTDOWN] Stopping gracefully. Progress saved ({total_saved} pairs on disk). Resume will pick up here.")
+                                pbar.close()
+                                print(f"\nGraceful shutdown complete. {total_saved} total Q&A pairs saved to: {raw_jsonl_path}")
+                                print("Re-run the same command to resume from where you left off.")
+                                llm_client.unload_model(model_name)
+                                return
                 else:
                     # Sequential chunk processing (default) — flush after each chunk
                     for chunk_idx, chunk in enumerate(chunks):
@@ -1302,162 +852,3 @@ def _run_qa_dataset(
 
     # Unload model from VRAM (only for Ollama)
     llm_client.unload_model(model_name)
-
-
-_ENRICHMENT_PROMPTS = {
-    "cyber": (
-        "You are a cybersecurity expert. Transform the provided Q&A into a structured report. "
-        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
-        "\"input\" = credible technical context (logs, tool output, scenario). "
-        "\"output\" = structured report with: summary, MITRE ATT&CK (TXXXX), CVSS, recommendations, IOC. "
-        "No markdown, no explanation, no code fences — just the raw JSON object."
-    ),
-    "finance": (
-        "You are a finance and markets expert. Transform the provided Q&A into a structured report. "
-        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
-        "\"input\" = credible financial context (market data, filings, or a scenario). "
-        "\"output\" = structured report with: summary, instruments or metrics, risk factors, "
-        "regulatory notes only when implied by the Q&A, and recommendations. "
-        "Do not invent tickers, prices, or regulations. "
-        "No markdown, no explanation, no code fences — just the raw JSON object."
-    ),
-    "generic": (
-        "You are a technical expert. Transform the provided Q&A into a structured report. "
-        "Return ONLY a valid JSON object with exactly two keys: \"input\" and \"output\". "
-        "\"input\" = realistic technical context. "
-        "\"output\" = structured report with: summary, key facts, constraints, and recommendations. "
-        "No markdown, no explanation, no code fences — just the raw JSON object."
-    ),
-}
-
-
-def _enrich_after_dedup(qa_list, ratio=0.3, model_name="gemma3:4b-it-q4_K_M", llm_client=None, output_path=None, domain="cyber"):
-    """Enrich a fraction of the deduplicated dataset just before saving.
-
-    Uses the shared LLMClient abstraction so enrichment works with both
-    Ollama and vLLM providers.
-
-    Resume support: if output_path exists, loads it and skips entries
-    already enriched. Saves incrementally (periodically and atomically) 
-    to support resume on crash.
-    """
-    if ratio <= 0 or not qa_list:
-        return qa_list
-
-    if llm_client is None:
-        llm_client = LLMClient(provider="ollama")
-    if domain not in _ENRICHMENT_PROMPTS:
-        raise ValueError("domain must be one of: cyber, finance, generic")
-
-    # Resume: load existing enriched data if available
-    already_enriched_count = 0
-    if output_path and os.path.exists(output_path):
-        try:
-            with open(output_path, 'r', encoding='utf-8') as f:
-                existing = json.load(f)
-            if isinstance(existing, list) and len(existing) == len(qa_list):
-                # Restore already-enriched entries
-                for i, entry in enumerate(existing):
-                    if isinstance(entry, dict) and isinstance(entry.get("_meta"), dict) and entry["_meta"].get("enriched"):
-                        qa_list[i] = entry
-                        already_enriched_count += 1
-                if already_enriched_count > 0:
-                    print(f"  Resuming enrichment: {already_enriched_count} entries already enriched.")
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"  [WARNING] Could not load existing enriched file for resume: {e}")
-
-    # Determine targets and indices
-    n_to_enrich = max(1, int(len(qa_list) * ratio))
-    target_new_to_enrich = n_to_enrich - already_enriched_count
-
-    if target_new_to_enrich <= 0:
-        print(f"\nPhase 5: All {already_enriched_count} target entries already enriched (target ratio {ratio*100:.0f}% met). Skipping.")
-        return qa_list
-
-    # Find all indices that are NOT yet enriched
-    non_enriched_indices = [
-        i for i, entry in enumerate(qa_list)
-        if not (isinstance(entry, dict) and isinstance(entry.get("_meta"), dict) and entry["_meta"].get("enriched"))
-    ]
-
-    # Sample exactly what is needed to reach the target ratio
-    rng = random.Random(getattr(llm_client, "seed", None))
-    indices = rng.sample(non_enriched_indices, min(target_new_to_enrich, len(non_enriched_indices)))
-
-    if not indices:
-        print("\nPhase 5: No more entries available to enrich. Skipping.")
-        return qa_list
-
-    system_prompt = _ENRICHMENT_PROMPTS[domain]
-
-    total_target = already_enriched_count + len(indices)
-    print(f"\nPhase 5: Post-deduplication enrichment: {len(indices)} remaining / {total_target} target ({ratio*100:.0f}%)...")
-
-    enriched_count = 0
-    
-    def _save_progress():
-        if output_path:
-            try:
-                atomic_write_text(
-                    output_path,
-                    json.dumps(qa_list, ensure_ascii=False, indent=2) + "\n",
-                )
-            except Exception as save_err:
-                tqdm.write(f"  [WARNING] Failed to save progress: {save_err}")
-
-    try:
-        for idx in tqdm(indices, desc="Enriching", unit="entry"):
-            entry = qa_list[idx]
-            if not isinstance(entry, dict):
-                continue
-            inst = entry.get("instruction", entry.get("question", ""))
-            ans = entry.get("output", entry.get("answer", ""))
-            if not inst or not ans:
-                continue
-
-            try:
-                content = llm_client.chat(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Question: {inst}\nAnswer: {ans}\n\nGenerate enriched input/output."}
-                    ],
-                    keep_alive=-1
-                )
-                result = _try_parse_enrichment_json(content)
-                if result and "input" in result and "output" in result:
-                    existing_meta = qa_list[idx].get("_meta", {})
-                    if not isinstance(existing_meta, dict):
-                        existing_meta = {}
-                    qa_list[idx] = {
-                        "instruction": inst,
-                        "input": result["input"],
-                        "output": result["output"] if isinstance(result["output"], str) else json.dumps(result["output"], ensure_ascii=False),
-                        "_meta": {
-                            **existing_meta,
-                            "enriched": True,
-                            "model": model_name,
-                            "domain": domain,
-                        }
-                    }
-                    enriched_count += 1
-                    
-                    # Save periodically (every 50 successful enrichments) to avoid excessive disk/CPU thrashing
-                    if enriched_count % 50 == 0:
-                        _save_progress()
-                else:
-                    preview = content[:300].replace('\n', ' ') if content else '<empty>'
-                    tqdm.write(f"  [SKIP] [{idx}] Could not parse enrichment JSON from LLM response. Preview: {preview}")
-            except Exception as e:
-                tqdm.write(f"  [FAIL] [{idx}] Error: {e}")
-            time.sleep(0.2)
-    finally:
-        # Final save on exit/interruption to ensure no progress is lost
-        if enriched_count > 0:
-            _save_progress()
-
-    final_total = sum(1 for e in qa_list if isinstance(e, dict) and isinstance(e.get("_meta"), dict) and e["_meta"].get("enriched"))
-    print(f"  Enrichment complete. {enriched_count} new + {already_enriched_count} resumed = {final_total} total enriched.\n")
-    return qa_list
-
-
